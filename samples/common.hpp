@@ -223,6 +223,47 @@ __host__ static inline void fillRand(DataT* mat, uint32_t m, uint32_t n)
     }
 }
 
+template <typename InputT,
+          typename OutputT,
+          typename ComputeT,
+          typename LayoutA,
+          typename LayoutB,
+          typename LayoutC,
+          typename LayoutD = LayoutC>
+__host__ void gemm_cpu_h(uint32_t       m,
+                         uint32_t       n,
+                         uint32_t       k,
+                         InputT const*  a,
+                         InputT const*  b,
+                         OutputT*       d,
+                         uint32_t       lda,
+                         uint32_t       ldb,
+                         uint32_t       ldd)
+{
+    auto rowMjr = [](uint32_t row, uint32_t col, uint32_t ld) { return row * ld + col; };
+    auto colMjr = [](uint32_t row, uint32_t col, uint32_t ld) { return col * ld + row; };
+
+    auto aIndex = std::is_same<LayoutA, rocwmma::row_major>::value ? rowMjr : colMjr;
+    auto bIndex = std::is_same<LayoutB, rocwmma::row_major>::value ? rowMjr : colMjr;
+    auto dIndex = std::is_same<LayoutD, rocwmma::row_major>::value ? rowMjr : colMjr;
+
+#pragma omp parallel for
+    for(int i = 0; i < m; ++i)
+    {
+#pragma omp parallel for
+        for(int j = 0; j < n; ++j)
+        {
+            ComputeT accum = static_cast<ComputeT>(0);
+            for(int h = 0; h < k; ++h)
+            {
+                accum += static_cast<ComputeT>(a[aIndex(i, h, lda)])
+                         * static_cast<ComputeT>(b[bIndex(h, j, ldb)]);
+            }
+            d[dIndex(i, j, ldd)] = accum;
+        }
+    }
+}
+
 // Host GEMM validation
 template <typename InputT,
           typename OutputT,
@@ -264,6 +305,18 @@ __host__ void gemm_cpu_h(uint32_t       m,
             {
                 accum += static_cast<ComputeT>(a[aIndex(i, h, lda)])
                          * static_cast<ComputeT>(b[bIndex(h, j, ldb)]);
+            }
+            if(i % 4 == 0){
+                accum *= 2;
+            }
+            else if(i % 4 == 1){
+                accum -= 7;
+            }
+            else if(i % 4 == 2){
+                accum += 9;
+            }
+            else{
+                accum /= 3;
             }
             d[dIndex(i, j, ldd)] = static_cast<OutputT>(
                 alpha * accum + beta * static_cast<ComputeT>(c[cIndex(i, j, ldc)]));

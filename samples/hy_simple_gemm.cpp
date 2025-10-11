@@ -227,7 +227,7 @@ namespace gfx9Params
     {
         ROCWMMA_M = 16u,
         ROCWMMA_N = 16u,
-        ROCWMMA_K = 128u,
+        ROCWMMA_K = 64u,
         BLOCKS_X  = 2u,
         BLOCKS_Y  = 2u,
         TBLOCK_X  = 128u,
@@ -261,9 +261,9 @@ using namespace gfx11Params;
 /// Types and Data Layouts
 ///
 
-using InputT   = float8_fnuz_t;
-using OutputT  = float32_t;
-using ComputeT = float32_t;
+using InputT   = int8_t;
+using OutputT  = int32_t;
+using ComputeT = int32_t;
 
 using DataLayoutA   = col_major;
 using DataLayoutB   = row_major;
@@ -291,7 +291,7 @@ using MfmaFragA   = fragment<matrix_a, ROCWMMA_M, ROCWMMA_N, ROCWMMA_K, InputT, 
 using MfmaFragB   = fragment<matrix_b, ROCWMMA_M, ROCWMMA_N, ROCWMMA_K, InputT, DataLayoutB>;
 using MfmaFragC   = fragment<accumulator, ROCWMMA_M, ROCWMMA_N, ROCWMMA_K, OutputT, DataLayoutC>;
 using MfmaFragD   = MfmaFragC;
-using MfmaFragAcc = fragment<accumulator, ROCWMMA_M, ROCWMMA_N, ROCWMMA_K, ComputeT>;
+using MfmaFragAcc = fragment<accumulator, ROCWMMA_M, ROCWMMA_N, ROCWMMA_K, ComputeT, DataLayoutC>;
 
 // Global read (macro tile)
 using GRBuffA = fragment<matrix_a, MACRO_TILE_X, ROCWMMA_N, ROCWMMA_K, InputT, DataLayoutA>;
@@ -517,14 +517,10 @@ ROCWMMA_KERNEL void __launch_bounds__(256) gemm_rocwmma_d(uint32_t       m,
                                                           uint32_t       k,
                                                           InputT const*  a,
                                                           InputT const*  b,
-                                                          OutputT const* c,
                                                           OutputT*       d,
                                                           uint32_t       lda,
                                                           uint32_t       ldb,
-                                                          uint32_t       ldc,
-                                                          uint32_t       ldd,
-                                                          ComputeT       alpha,
-                                                          ComputeT       beta)
+                                                          uint32_t       ldd)
 {
     if constexpr(!ROCWMMA_ARCH_HOST)
     {
@@ -684,11 +680,11 @@ ROCWMMA_KERNEL void __launch_bounds__(256) gemm_rocwmma_d(uint32_t       m,
         ///
         /// Start loading C
         ///
-        using MfmaFragCMap1d = GetDataLayout_t<MfmaFragC>;
+        // using MfmaFragCMap1d = GetDataLayout_t<MfmaFragC>;
         using MfmaFragDMap1d = GetDataLayout_t<MfmaFragD>;
 
-        MfmaFragC fragsC[BLOCKS_X][BLOCKS_Y];
-        globalReadC(fragsC, c + MfmaFragCMap1d::fromMatrixCoord(warpTileCoord, ldc), ldc);
+        // MfmaFragC fragsC[BLOCKS_X][BLOCKS_Y];
+        // globalReadC(fragsC, c + MfmaFragCMap1d::fromMatrixCoord(warpTileCoord, ldc), ldc);
 
         ///
         /// Clean up tail A * B
@@ -704,13 +700,13 @@ ROCWMMA_KERNEL void __launch_bounds__(256) gemm_rocwmma_d(uint32_t       m,
         ///
         /// D = alpha * accum + beta * C
         ///
-        MfmaFragD fragsD[BLOCKS_X][BLOCKS_Y];
-        uniformFma(fragsD, alpha, fragsAcc, beta, fragsC);
-        globalWriteD(d + MfmaFragDMap1d::fromMatrixCoord(warpTileCoord, ldd), fragsD, ldd);
+        // MfmaFragD fragsD[BLOCKS_X][BLOCKS_Y];
+        // uniformFma(fragsD, alpha, fragsAcc, beta, fragsC);
+        globalWriteD(d + MfmaFragDMap1d::fromMatrixCoord(warpTileCoord, ldd), fragsAcc, ldd);
     }
 }
 
-ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, ComputeT beta)
+ROCWMMA_HOST void simple_gemm(uint32_t m, uint32_t n, uint32_t k)
 {
     // Runtime checks for host parameters
     uint32_t hTBLOCK_X    = isGfx9() ? gfx9Params::TBLOCK_X : gfx11Params::TBLOCK_X;
@@ -772,36 +768,30 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
     // Initialize input matrices
     std::vector<InputT>  matrixA(m * k);
     std::vector<InputT>  matrixB(k * n);
-    std::vector<OutputT> matrixC(m * n);
 
     // Fill outputs with NaN to catch contamination
     std::vector<OutputT> matrixD(m * n, std::numeric_limits<OutputT>::signaling_NaN());
 
     fillRand(matrixA.data(), m, k);
     fillRand(matrixB.data(), k, n);
-    fillRand(matrixC.data(), m, n);
 
     std::cout << "Initializing device data..." << std::endl;
 
     // Allocate and copy device memory
     InputT*  d_a;
     InputT*  d_b;
-    OutputT* d_c;
     OutputT* d_d;
 
     const size_t bytesA = matrixA.size() * sizeof(InputT);
     const size_t bytesB = matrixB.size() * sizeof(InputT);
-    const size_t bytesC = matrixC.size() * sizeof(OutputT);
     const size_t bytesD = matrixD.size() * sizeof(OutputT);
 
     CHECK_HIP_ERROR(hipMalloc(&d_a, bytesA));
     CHECK_HIP_ERROR(hipMalloc(&d_b, bytesB));
-    CHECK_HIP_ERROR(hipMalloc(&d_c, bytesC));
     CHECK_HIP_ERROR(hipMalloc(&d_d, bytesD));
 
     CHECK_HIP_ERROR(hipMemcpy(d_a, matrixA.data(), bytesA, hipMemcpyHostToDevice));
     CHECK_HIP_ERROR(hipMemcpy(d_b, matrixB.data(), bytesB, hipMemcpyHostToDevice));
-    CHECK_HIP_ERROR(hipMemcpy(d_c, matrixC.data(), bytesC, hipMemcpyHostToDevice));
     CHECK_HIP_ERROR(hipMemcpy(d_d, matrixD.data(), bytesD, hipMemcpyHostToDevice));
 
     auto blockDim = dim3(hTBLOCK_X, hTBLOCK_Y);
@@ -831,14 +821,10 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
                               k,
                               d_a,
                               d_b,
-                              d_c,
                               d_d,
                               lda,
                               ldb,
-                              ldc,
-                              ldd,
-                              alpha,
-                              beta);
+                              ldd);
     };
 
     constexpr uint32_t warmups    = 2u;
@@ -878,14 +864,12 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
               << "BlocksX, BlocksY, "
               << "BlkM, BlkN, BlkK, "
               << "MatM, MatN, MatK, "
-              << "alpha, lda, ldb, "
-              << "beta, ldc, ldd, "
-              << "elapsedMs, Problem Size(GFlops), TFlops/s" << "," << "sizeof(intputT)" << std::endl;
+              << "lda, ldb, ldd"
+              << "elapsedus, Problem Size(GFlops), TFlops/s" << "," << "sizeof(intputT)" << std::endl;
 
     std::cout << hTBLOCK_X << ", " << hTBLOCK_Y << ", " << hBLOCKS_X << ", " << hBLOCKS_Y << ", "
               << hROCWMMA_M << ", " << hROCWMMA_N << ", " << hROCWMMA_K << ", " << m << ", " << n
-              << ", " << k << ", " << alpha << ", " << lda << ", " << ldb << ", " << beta << ", "
-              << ldc << ", " << ldd << ", " << elapsedTimeMs << ", " << gFlops << ", "
+              << ", " << k  << ", " << lda << ", " << ldb << ", " << ldd << ", " << elapsedTimeMs * 200<< ", " << gFlops << ", "
               << tFlopsPerSec << "," << sizeof(InputT) << std::endl;
 
 #if !NDEBUG
@@ -907,15 +891,11 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
                                                                                  k,
                                                                                  matrixA.data(),
                                                                                  matrixB.data(),
-                                                                                 matrixC.data(),
                                                                                  matrixD_ref.data(),
                                                                                  lda,
                                                                                  ldb,
-                                                                                 ldc,
-                                                                                 ldd,
-                                                                                 alpha,
-                                                                                 beta);
-
+                                                                                 ldd);
+    std::cout<<"calculation finished"<<std::endl;
     auto res = compareEqual(matrixD.data(), matrixD_ref.data(), m * n);
 
     if(std::get<0>(res) == false)
@@ -934,7 +914,6 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
     // Release device memory
     CHECK_HIP_ERROR(hipFree(d_a));
     CHECK_HIP_ERROR(hipFree(d_b));
-    CHECK_HIP_ERROR(hipFree(d_c));
     CHECK_HIP_ERROR(hipFree(d_d));
 
     std::cout << "Finished!" << std::endl;
@@ -942,12 +921,6 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
 
 int main()
 {
-    std::cout << "---------------------------------------" << std::endl;
-    gemm_test(2048, 1024, 1024, 2, 2);
-    // std::cout << "---------------------------------------" << std::endl;
-    // gemm_test(8992, 64, 8992, 2, 2);
-    // std::cout << "---------------------------------------" << std::endl;
-    // gemm_test(8961, 64, 8961, 2, 2);
-    // std::cout << "---------------------------------------" << std::endl;
+    simple_gemm(4096, 4096, 4096);
     return 0;
 }

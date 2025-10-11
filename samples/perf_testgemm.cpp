@@ -225,9 +225,9 @@ namespace gfx9Params
 {
     enum kernelParams : uint32_t
     {
-        ROCWMMA_M = 16u,
-        ROCWMMA_N = 16u,
-        ROCWMMA_K = 128u,
+        ROCWMMA_M = 32u,
+        ROCWMMA_N = 32u,
+        ROCWMMA_K = 16u,
         BLOCKS_X  = 2u,
         BLOCKS_Y  = 2u,
         TBLOCK_X  = 128u,
@@ -261,8 +261,8 @@ using namespace gfx11Params;
 /// Types and Data Layouts
 ///
 
-using InputT   = float8_fnuz_t;
-using OutputT  = float32_t;
+using InputT   = float16_t;
+using OutputT  = float16_t;
 using ComputeT = float32_t;
 
 using DataLayoutA   = col_major;
@@ -880,13 +880,13 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
               << "MatM, MatN, MatK, "
               << "alpha, lda, ldb, "
               << "beta, ldc, ldd, "
-              << "elapsedMs, Problem Size(GFlops), TFlops/s" << "," << "sizeof(intputT)" << std::endl;
+              << "elapsedMs, Problem Size(GFlops), TFlops/s" << std::endl;
 
     std::cout << hTBLOCK_X << ", " << hTBLOCK_Y << ", " << hBLOCKS_X << ", " << hBLOCKS_Y << ", "
               << hROCWMMA_M << ", " << hROCWMMA_N << ", " << hROCWMMA_K << ", " << m << ", " << n
               << ", " << k << ", " << alpha << ", " << lda << ", " << ldb << ", " << beta << ", "
               << ldc << ", " << ldd << ", " << elapsedTimeMs << ", " << gFlops << ", "
-              << tFlopsPerSec << "," << sizeof(InputT) << std::endl;
+              << tFlopsPerSec << std::endl;
 
 #if !NDEBUG
 
@@ -942,12 +942,7 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
 
 int main()
 {
-    std::cout << "---------------------------------------" << std::endl;
-    gemm_test(2048, 1024, 1024, 2, 2);
-    // std::cout << "---------------------------------------" << std::endl;
-    // gemm_test(8992, 64, 8992, 2, 2);
-    // std::cout << "---------------------------------------" << std::endl;
-    // gemm_test(8961, 64, 8961, 2, 2);
-    // std::cout << "---------------------------------------" << std::endl;
+    gemm_test(5120, 4096, 7168, 2, 2);
     return 0;
 }
+

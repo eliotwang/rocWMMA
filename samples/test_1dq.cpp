@@ -227,7 +227,7 @@ namespace gfx9Params
     {
         ROCWMMA_M = 16u,
         ROCWMMA_N = 16u,
-        ROCWMMA_K = 128u,
+        ROCWMMA_K = 32u,
         BLOCKS_X  = 2u,
         BLOCKS_Y  = 2u,
         TBLOCK_X  = 128u,
@@ -266,9 +266,9 @@ using OutputT  = float32_t;
 using ComputeT = float32_t;
 
 using DataLayoutA   = col_major;
-using DataLayoutB   = row_major;
-using DataLayoutC   = row_major;
-using DataLayoutLds = col_major;
+using DataLayoutB   = col_major;
+using DataLayoutC   = col_major;
+using DataLayoutLds = row_major;
 
 ///
 /// Fragment types
@@ -541,172 +541,177 @@ ROCWMMA_KERNEL void __launch_bounds__(256) gemm_rocwmma_d(uint32_t       m,
         auto           localWarpCoord  = make_coord2d(threadIdx.x / WARP_SIZE, threadIdx.y);
         auto           localWarpOffset = localWarpCoord * warpTileSize;
 
-        // Global matrix coordinates for C/D
-        auto macroTileCoord = make_coord2d(blockIdx.x, blockIdx.y) * macroTileSize;
-        auto warpTileCoord  = macroTileCoord + localWarpOffset;
-
-        // Bounds check
-        auto warpTileBound = warpTileCoord + warpTileSize;
-        if(get<0>(warpTileBound) > m || get<1>(warpTileBound) > n)
+        const int iter = (n + MACRO_TILE_Y - 1) / MACRO_TILE_Y;
+        for(int i = 0; i < iter; i++)
         {
-            return;
-        }
+            // Global matrix coordinates for C/D
+            auto macroTileCoord = make_coord2d(blockIdx.x, i) * macroTileSize;
+            auto warpTileCoord  = macroTileCoord + localWarpOffset;
 
-        ///
-        /// 1D global read coordinate setup
-        ///
-        using GRBuffAMap1d = GetDataLayout_t<GRBuffA>;
-        using GRBuffBMap1d = GetDataLayout_t<GRBuffB>;
+            // Bounds check
+            auto warpTileBound = warpTileCoord + warpTileSize;
+            if(get<0>(warpTileBound) > m || get<1>(warpTileBound) > n)
+            {
+                continue;
+            }
 
-        // Initial globa read address offsets
-        auto globalReadOffsetA
-            = GRBuffAMap1d::fromMatrixCoord(make_coord2d(get<0>(macroTileCoord), 0u), lda);
-        auto globalReadOffsetB
-            = GRBuffBMap1d::fromMatrixCoord(make_coord2d(0u, get<1>(macroTileCoord)), ldb);
+            ///
+            /// 1D global read coordinate setup
+            ///
+            using GRBuffAMap1d = GetDataLayout_t<GRBuffA>;
+            using GRBuffBMap1d = GetDataLayout_t<GRBuffB>;
 
-        // Incremental global read address offsets
-        auto kStepOffsetA = GRBuffAMap1d::fromMatrixCoord(make_coord2d(0u, ROCWMMA_K), lda);
-        auto kStepOffsetB = GRBuffBMap1d::fromMatrixCoord(make_coord2d(ROCWMMA_K, 0u), ldb);
+            // Initial globa read address offsets
+            auto globalReadOffsetA
+                = GRBuffAMap1d::fromMatrixCoord(make_coord2d(get<0>(macroTileCoord), 0u), lda);
+            auto globalReadOffsetB
+                = GRBuffBMap1d::fromMatrixCoord(make_coord2d(0u, get<1>(macroTileCoord)), ldb);
 
-        ///
-        /// Cooperative config for global read A / B
-        ///
+            // Incremental global read address offsets
+            auto kStepOffsetA = GRBuffAMap1d::fromMatrixCoord(make_coord2d(0u, ROCWMMA_K), lda);
+            auto kStepOffsetB = GRBuffBMap1d::fromMatrixCoord(make_coord2d(ROCWMMA_K, 0u), ldb);
 
-        // WorkItems will be split up by minimum IOCount to perform either global read or local write.
-        // These are inputs to cooperative functions.
-        constexpr auto warpCount = get<0>(warpDims) * get<1>(warpDims);
+            ///
+            /// Cooperative config for global read A / B
+            ///
 
-        // Scheduling warp order is analogous to row major priority.
-        // E.g. Wg = (128, 2) = 2x2 warps
-        // (0, 0)   (0, 1)   Share Schedule: w0 = (0, 0), w1 = (0, 1),
-        // (1, 0)   (1, 1)                   w2 = (1, 0), w3 = (1, 1), count = 4
-        const auto warpIndex = get<0>(localWarpCoord) * get<1>(warpDims) + get<1>(localWarpCoord);
+            // WorkItems will be split up by minimum IOCount to perform either global read or local write.
+            // These are inputs to cooperative functions.
+            constexpr auto warpCount = get<0>(warpDims) * get<1>(warpDims);
 
-        ///
-        /// Perform initial global pre-fetch
-        ///
+            // Scheduling warp order is analogous to row major priority.
+            // E.g. Wg = (128, 2) = 2x2 warps
+            // (0, 0)   (0, 1)   Share Schedule: w0 = (0, 0), w1 = (0, 1),
+            // (1, 0)   (1, 1)                   w2 = (1, 0), w3 = (1, 1), count = 4
+            const auto warpIndex = get<0>(localWarpCoord) * get<1>(warpDims) + get<1>(localWarpCoord);
 
-        GRBuffA grBuffA;
-        GRBuffB grBuffB;
+            ///
+            /// Perform initial global pre-fetch
+            ///
 
-        globalReadCoopA<warpCount>(grBuffA, a + globalReadOffsetA, lda, warpIndex);
-        globalReadCoopB<warpCount>(grBuffB, b + globalReadOffsetB, ldb, warpIndex);
+            GRBuffA grBuffA;
+            GRBuffB grBuffB;
 
-        globalReadOffsetA += kStepOffsetA;
-        globalReadOffsetB += kStepOffsetB;
-
-        ///
-        /// Setup LDS addressing
-        /// This kernel will use 2 separate LDS blocks for pipelining
-        /// the input prefetching during the accumulation loop
-        ///
-
-        HIP_DYNAMIC_SHARED(void*, localMemPtr);
-        using LWBuffAShape = GetIOShape_t<LWBuffA>;
-        using LWBuffBShape = GetIOShape_t<LWBuffB>;
-        using LWBuffAMap1d = GetDataLayout_t<LWBuffA>;
-        using LWBuffBMap1d = GetDataLayout_t<LWBuffB>;
-
-        constexpr uint32_t ldsWidth  = ROCWMMA_K;
-        constexpr uint32_t ldsHeight = LWBuffAShape::BlockHeight + LWBuffBShape::BlockHeight;
-        constexpr uint32_t sizeLds   = ldsHeight * ldsWidth;
-        constexpr uint32_t ldsld = std::is_same_v<DataLayoutLds, row_major> ? ldsWidth : ldsHeight;
-
-        auto* ldsPtrLo = reinterpret_cast<InputT*>(localMemPtr);
-        auto* ldsPtrHi = ldsPtrLo + sizeLds;
-
-        // Local write offsets to start of A / B data
-        auto ldsWriteOffsetA = 0u;
-        auto ldsWriteOffsetB
-            = LWBuffAMap1d::fromMatrixCoord(make_coord2d(LWBuffAShape::BlockHeight, 0u), ldsld);
-
-        // Local read offsets for mfma frags
-        auto ldsReadOffsetA
-            = ldsWriteOffsetA
-              + LWBuffAMap1d::fromMatrixCoord(make_coord2d(get<0>(localWarpOffset), 0u), ldsld);
-        auto ldsReadOffsetB
-            = ldsWriteOffsetB
-              + LWBuffBMap1d::fromMatrixCoord(make_coord2d(get<1>(localWarpOffset), 0u), ldsld);
-
-        ///
-        /// Write prefetch to local
-        ///
-        localWriteCoopA<warpCount>(ldsPtrLo + ldsWriteOffsetA, grBuffA, ldsld, warpIndex);
-        localWriteCoopB<warpCount>(ldsPtrLo + ldsWriteOffsetB, grBuffB, ldsld, warpIndex);
-
-        ///
-        /// Initialize accumulation frags
-        ///
-        MfmaFragAcc fragsAcc[BLOCKS_X][BLOCKS_Y];
-        fill(fragsAcc, 0.0f);
-
-        ///
-        /// Synchronize warps and memory
-        ///
-        synchronize_workgroup();
-
-        ///
-        /// Accumulate A * B for all mfma frags in warp tile
-        ///
-        for(uint32_t currentK = ROCWMMA_K; currentK < k; currentK += ROCWMMA_K)
-        {
-            MfmaFragA fragsA[BLOCKS_X];
-            MfmaFragB fragsB[BLOCKS_Y];
-
-            // Local read mfma frags from first LDS buffer
-            localReadA(fragsA, ldsPtrLo + ldsReadOffsetA, ldsld);
-            localReadB(fragsB, ldsPtrLo + ldsReadOffsetB, ldsld);
-
-            // Prefetch next round of global frags
             globalReadCoopA<warpCount>(grBuffA, a + globalReadOffsetA, lda, warpIndex);
             globalReadCoopB<warpCount>(grBuffB, b + globalReadOffsetB, ldb, warpIndex);
 
-            // Advance offsets to next k step
             globalReadOffsetA += kStepOffsetA;
             globalReadOffsetB += kStepOffsetB;
 
-            // accum(A * B)
-            mfma(fragsAcc, fragsA, fragsB, fragsAcc);
+            ///
+            /// Setup LDS addressing
+            /// This kernel will use 2 separate LDS blocks for pipelining
+            /// the input prefetching during the accumulation loop
+            ///
 
-            // Write prefetch to second LDS buffer
-            localWriteCoopA<warpCount>(ldsPtrHi + ldsWriteOffsetA, grBuffA, ldsld, warpIndex);
-            localWriteCoopB<warpCount>(ldsPtrHi + ldsWriteOffsetB, grBuffB, ldsld, warpIndex);
+            HIP_DYNAMIC_SHARED(void*, localMemPtr);
+            using LWBuffAShape = GetIOShape_t<LWBuffA>;
+            using LWBuffBShape = GetIOShape_t<LWBuffB>;
+            using LWBuffAMap1d = GetDataLayout_t<LWBuffA>;
+            using LWBuffBMap1d = GetDataLayout_t<LWBuffB>;
 
-            // Make sure that all waves have finished reading / writing to lds for currentK.
+            constexpr uint32_t ldsWidth  = ROCWMMA_K;
+            constexpr uint32_t ldsHeight = LWBuffAShape::BlockHeight + LWBuffBShape::BlockHeight;
+            constexpr uint32_t sizeLds   = ldsHeight * ldsWidth;
+            constexpr uint32_t ldsld = std::is_same_v<DataLayoutLds, row_major> ? ldsWidth : ldsHeight;
+
+            auto* ldsPtrLo = reinterpret_cast<InputT*>(localMemPtr);
+            auto* ldsPtrHi = ldsPtrLo + sizeLds;
+
+            // Local write offsets to start of A / B data
+            auto ldsWriteOffsetA = 0u;
+            auto ldsWriteOffsetB
+                = LWBuffAMap1d::fromMatrixCoord(make_coord2d(LWBuffAShape::BlockHeight, 0u), ldsld);
+
+            // Local read offsets for mfma frags
+            auto ldsReadOffsetA
+                = ldsWriteOffsetA
+                + LWBuffAMap1d::fromMatrixCoord(make_coord2d(get<0>(localWarpOffset), 0u), ldsld);
+            auto ldsReadOffsetB
+                = ldsWriteOffsetB
+                + LWBuffBMap1d::fromMatrixCoord(make_coord2d(get<1>(localWarpOffset), 0u), ldsld);
+
+            ///
+            /// Write prefetch to local
+            ///
+            localWriteCoopA<warpCount>(ldsPtrLo + ldsWriteOffsetA, grBuffA, ldsld, warpIndex);
+            localWriteCoopB<warpCount>(ldsPtrLo + ldsWriteOffsetB, grBuffB, ldsld, warpIndex);
+
+            ///
+            /// Initialize accumulation frags
+            ///
+            MfmaFragAcc fragsAcc[BLOCKS_X][BLOCKS_Y];
+            fill(fragsAcc, 0.0f);
+
+            ///
+            /// Synchronize warps and memory
+            ///
             synchronize_workgroup();
 
-            // Swap Lds buffers
-            auto* tmp = ldsPtrLo;
-            ldsPtrLo  = ldsPtrHi;
-            ldsPtrHi  = tmp;
+            ///
+            /// Accumulate A * B for all mfma frags in warp tile
+            ///
+            for(uint32_t currentK = ROCWMMA_K; currentK < k; currentK += ROCWMMA_K)
+            {
+                MfmaFragA fragsA[BLOCKS_X];
+                MfmaFragB fragsB[BLOCKS_Y];
+
+                // Local read mfma frags from first LDS buffer
+                localReadA(fragsA, ldsPtrLo + ldsReadOffsetA, ldsld);
+                localReadB(fragsB, ldsPtrLo + ldsReadOffsetB, ldsld);
+
+                // Prefetch next round of global frags
+                globalReadCoopA<warpCount>(grBuffA, a + globalReadOffsetA, lda, warpIndex);
+                globalReadCoopB<warpCount>(grBuffB, b + globalReadOffsetB, ldb, warpIndex);
+
+                // Advance offsets to next k step
+                globalReadOffsetA += kStepOffsetA;
+                globalReadOffsetB += kStepOffsetB;
+
+                // accum(A * B)
+                mfma(fragsAcc, fragsA, fragsB, fragsAcc);
+
+                // Write prefetch to second LDS buffer
+                localWriteCoopA<warpCount>(ldsPtrHi + ldsWriteOffsetA, grBuffA, ldsld, warpIndex);
+                localWriteCoopB<warpCount>(ldsPtrHi + ldsWriteOffsetB, grBuffB, ldsld, warpIndex);
+
+                // Make sure that all waves have finished reading / writing to lds for currentK.
+                synchronize_workgroup();
+
+                // Swap Lds buffers
+                auto* tmp = ldsPtrLo;
+                ldsPtrLo  = ldsPtrHi;
+                ldsPtrHi  = tmp;
+            }
+
+            ///
+            /// Start loading C
+            ///
+            using MfmaFragCMap1d = GetDataLayout_t<MfmaFragC>;
+            using MfmaFragDMap1d = GetDataLayout_t<MfmaFragD>;
+
+            MfmaFragC fragsC[BLOCKS_X][BLOCKS_Y];
+            globalReadC(fragsC, c + MfmaFragCMap1d::fromMatrixCoord(warpTileCoord, ldc), ldc);
+
+            ///
+            /// Clean up tail A * B
+            ///
+            MfmaFragA fragsA[BLOCKS_X];
+            MfmaFragB fragsB[BLOCKS_Y];
+
+            // Local read mfma frags
+            localReadA(fragsA, ldsPtrLo + ldsReadOffsetA, ldsld);
+            localReadB(fragsB, ldsPtrLo + ldsReadOffsetB, ldsld);
+            mfma(fragsAcc, fragsA, fragsB, fragsAcc);// to do: add write to lds 
+
+            ///
+            /// D = alpha * accum + beta * C
+            ///
+            MfmaFragD fragsD[BLOCKS_X][BLOCKS_Y];
+            uniformFma(fragsD, alpha, fragsAcc, beta, fragsC);
+            globalWriteD(d + MfmaFragDMap1d::fromMatrixCoord(warpTileCoord, ldd), fragsD, ldd);
         }
-
-        ///
-        /// Start loading C
-        ///
-        using MfmaFragCMap1d = GetDataLayout_t<MfmaFragC>;
-        using MfmaFragDMap1d = GetDataLayout_t<MfmaFragD>;
-
-        MfmaFragC fragsC[BLOCKS_X][BLOCKS_Y];
-        globalReadC(fragsC, c + MfmaFragCMap1d::fromMatrixCoord(warpTileCoord, ldc), ldc);
-
-        ///
-        /// Clean up tail A * B
-        ///
-        MfmaFragA fragsA[BLOCKS_X];
-        MfmaFragB fragsB[BLOCKS_Y];
-
-        // Local read mfma frags
-        localReadA(fragsA, ldsPtrLo + ldsReadOffsetA, ldsld);
-        localReadB(fragsB, ldsPtrLo + ldsReadOffsetB, ldsld);
-        mfma(fragsAcc, fragsA, fragsB, fragsAcc);
-
-        ///
-        /// D = alpha * accum + beta * C
-        ///
-        MfmaFragD fragsD[BLOCKS_X][BLOCKS_Y];
-        uniformFma(fragsD, alpha, fragsAcc, beta, fragsC);
-        globalWriteD(d + MfmaFragDMap1d::fromMatrixCoord(warpTileCoord, ldd), fragsD, ldd);
+        
     }
 }
 
@@ -805,8 +810,7 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
     CHECK_HIP_ERROR(hipMemcpy(d_d, matrixD.data(), bytesD, hipMemcpyHostToDevice));
 
     auto blockDim = dim3(hTBLOCK_X, hTBLOCK_Y);
-    auto gridDim  = dim3(rocwmma::ceilDiv(m, get<0>(macroTileSize)),
-                        rocwmma::ceilDiv(n, get<1>(macroTileSize)));
+    auto gridDim  = dim3(rocwmma::ceilDiv(m, get<0>(macroTileSize)));
 
     std::cout << "Launching GEMM kernel..." << std::endl;
     std::cout << "gridDim (" << gridDim.x << " " << gridDim.y << ")"
@@ -942,12 +946,6 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
 
 int main()
 {
-    std::cout << "---------------------------------------" << std::endl;
-    gemm_test(2048, 1024, 1024, 2, 2);
-    // std::cout << "---------------------------------------" << std::endl;
-    // gemm_test(8992, 64, 8992, 2, 2);
-    // std::cout << "---------------------------------------" << std::endl;
-    // gemm_test(8961, 64, 8961, 2, 2);
-    // std::cout << "---------------------------------------" << std::endl;
+    gemm_test(8960, 64, 8960, 2, 2);
     return 0;
 }
