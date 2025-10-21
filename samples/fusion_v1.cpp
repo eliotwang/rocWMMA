@@ -35,7 +35,7 @@
 #include <rocwmma/rocwmma_transforms.hpp>
 
 #include "common.hpp"
-// #include <stdio.h>
+#include <stdio.h>
 /* Motivation
 *
 * For this particular GEMM kernel, high performance can be
@@ -225,8 +225,8 @@ namespace gfx9Params
 {
     enum kernelParams : uint32_t
     {
-        ROCWMMA_M = 16u,
-        ROCWMMA_N = 16u,
+        ROCWMMA_M = 32u,
+        ROCWMMA_N = 32u,
         ROCWMMA_K = 32u,
         BLOCKS_X  = 2u,
         BLOCKS_Y  = 2u,
@@ -296,6 +296,9 @@ using MfmaFragB   = fragment<matrix_b, ROCWMMA_M, ROCWMMA_N, ROCWMMA_K, InputT, 
 using MfmaFragC   = fragment<accumulator, ROCWMMA_M, ROCWMMA_N, ROCWMMA_K, OutputT, DataLayoutC>;
 using MfmaFragD   = MfmaFragC;
 using MfmaFragAcc = fragment<accumulator, ROCWMMA_M, ROCWMMA_N, ROCWMMA_K, ComputeT,DataLayoutC>;
+
+using MfmaFragS   = fragment<matrix_a, ROCWMMA_M, ROCWMMA_N, MACRO_TILE_Y, InputT, DataLayoutA>;
+using MfmaFragV   = fragment<matrix_b, ROCWMMA_M, ROCWMMA_N, MACRO_TILE_Y, InputT, DataLayoutB>;
 
 // Global read (macro tile)
 using GRBuffA = fragment<matrix_a, MACRO_TILE_X, ROCWMMA_N, ROCWMMA_K, InputT, DataLayoutA>;
@@ -645,9 +648,6 @@ ROCWMMA_KERNEL void __launch_bounds__(256) gemm_rocwmma_d(uint32_t       m,
             globalReadCoopA<warpCount>(grBuffA, a + globalReadOffsetA, lda, warpIndex);
             globalReadCoopB<warpCount>(grBuffB, b + globalReadOffsetB, ldb, warpIndex);
 
-            // for(int i=0;i<grBuffB.num_elements;i++){
-            //     printf("%d,\n",grBuffB.x[i]);
-            // }
             globalReadOffsetA += kStepOffsetA;
             globalReadOffsetB += kStepOffsetB;
 
@@ -717,10 +717,6 @@ ROCWMMA_KERNEL void __launch_bounds__(256) gemm_rocwmma_d(uint32_t       m,
                 globalReadCoopA<warpCount>(grBuffA, a + globalReadOffsetA, lda, warpIndex);
                 globalReadCoopB<warpCount>(grBuffB, b + globalReadOffsetB, ldb, warpIndex);
 
-                // for(int i=0;i<grBuffB.num_elements;i++){
-                //     // printf("size:%d,\n",grBuffB.num_elements);
-                //     printf("%d,\n",grBuffB.x[i]);
-                // }
                 // Advance offsets to next k step
                 globalReadOffsetA += kStepOffsetA;
                 globalReadOffsetB += kStepOffsetB;
@@ -761,38 +757,6 @@ ROCWMMA_KERNEL void __launch_bounds__(256) gemm_rocwmma_d(uint32_t       m,
             localReadB(fragsB, ldsPtrLo + ldsReadOffsetB, ldsld);
             mfma(fragsAcc, fragsA, fragsB, fragsAcc);// to do: add write to lds 
 
-            // for(int i = 0; i < BLOCKS_X; i++)
-            // {
-            //     for(int j = 0; j < BLOCKS_Y; j++)
-            //     {
-            //         for(int k = 0; k < fragsAcc[BLOCKS_X][BLOCKS_Y].num_elements; k++)
-            //         {
-            //             printf("%d\n",fragsAcc[BLOCKS_X][BLOCKS_Y].x[k]);
-            //         }
-            //     }
-            // }
-            // fill(fragsAcc, 1.0f);
-            // // printf("blockIdx.x:%d ,iter:%d \n",blockIdx.x,iter);
-            // if(blockIdx.x == 0 && iter == 0)
-            // {
-            //     for(int i = 0; i < BLOCKS_X; i++)
-            //     {
-            //         for(int j = 0; j < BLOCKS_Y; j++)
-            //         {
-            //             printf("before fragAcc[%d][%d]:\n",i,j);
-            //             const auto& frag = fragsAcc[i][j];
-            //             // auto v = frag[k - 1];
-            //             for(int k = 1; k <= fragsAcc[i][j].size(); k++)
-            //             {
-            //                 auto v = frag[k - 1];
-            //                 printf("%d  ", static_cast<int>(v));
-            //                 if(k % ROCWMMA_N == 0){
-            //                     printf("\n");
-            //                 }
-            //             }
-            //         }
-            //     }
-            // }
 
             //  Here,we try use store/load_matrix_sync interface to get a row data by reset LDS height 
             //  and width logically.
@@ -806,67 +770,40 @@ ROCWMMA_KERNEL void __launch_bounds__(256) gemm_rocwmma_d(uint32_t       m,
 
             localWriteAcc(fragsAcc,ldsPtr + ldsReadOffsetAcc,ldsld_new);
             synchronize_workgroup();
-            
-            // if(blockIdx.x == 0 && iter == 0)
-            // {
-            //     for(int i = 0; i < BLOCKS_X; i++)
-            //     {
-            //         for(int j = 0; j < BLOCKS_Y; j++)
-            //         {
-            //             printf("before fragAcc[%d][%d]:\n",i,j);
-            //             for(int k = 1; k <= fragsAcc[i][j].size(); k++)
-            //             {
-            //                 printf("%d  ", fragsAcc[i][j][k-1]);
-            //                 if(k % ROCWMMA_N == 0){
-            //                     printf("\n");
-            //                 }
-            //             }
-            //         }
-            //     }
-            // }
 
             //  transform data for validate
-            // for(int i = 0; i < BLOCKS_X; i++)
-            // {
-            //     for(int j = 0; j < BLOCKS_Y; j++)
-            //     {
-            //         auto baseoffset = ldsReadOffsetAcc + i * ROCWMMA_M * ldsld_new + j * ROCWMMA_N;
-            //         auto threadoffset = threadIdx.x % threads_per_row * els_per_thread
-            //                             + (threadIdx.x) % WARP_SIZE / threads_per_row * ldsld_new;
+            for(int i = 0; i < BLOCKS_X; i++)
+            {
+                for(int j = 0; j < BLOCKS_Y; j++)
+                {
+                    auto baseoffset = ldsReadOffsetAcc + i * ROCWMMA_M * ldsld_new + j * ROCWMMA_N;
+                    // if( i == j && i == 0 && get<0>(localWarpOffset) > 0){
+                    //     printf("lolcal warp offset:%u\n", baseoffset);
+                    // }
+                    auto threadoffset = threadIdx.x % threads_per_row * els_per_thread
+                                        + (threadIdx.x) % WARP_SIZE / threads_per_row * ldsld_new;
 
-            //         if((threadIdx.x / threads_per_row) % 4 == 0){
-            //             for(int k = 0; k < els_per_thread; k++)
-            //             {
-            //                 ldsPtr[baseoffset + threadoffset + k] *= 2;
-            //                 ldsPtr[baseoffset + threadoffset + k] %= 220;
-            //             }
-            //             // if(baseoffset + threadoffset + k > 2048 && baseoffset + threadoffset + k < 3072){
-            //             //     printf("lolcal warp offset:%u\n", baseoffset + threadoffset);
-            //             // }
-            //         }
-            //         else if((threadIdx.x / threads_per_row) % 4 == 1){
-            //             for(int k = 0; k < els_per_thread; k++)
-            //             {
-            //                 ldsPtr[baseoffset + threadoffset + k] -= 7;
-            //                 ldsPtr[baseoffset + threadoffset + k] %= 220;
-            //             }
-            //         }
-            //         else if((threadIdx.x / threads_per_row) % 4 == 2){
-            //             for(int k = 0; k < els_per_thread; k++)
-            //             {
-            //                 ldsPtr[baseoffset + threadoffset + k] += 9;
-            //                 ldsPtr[baseoffset + threadoffset + k] %= 220;
-            //             }
-            //         }
-            //         else{
-            //             for(int k = 0; k < els_per_thread; k++)
-            //             {
-            //                 ldsPtr[baseoffset + threadoffset + k] += 3;
-            //                 ldsPtr[baseoffset + threadoffset + k] %= 220;
-            //             }
-            //         }
-            //     }
-            // }
+                    if((threadIdx.x / threads_per_row) % 4 == 0){
+                        for(int k = 0; k < els_per_thread; k++)
+                            ldsPtr[baseoffset + threadoffset + k] *= 2;
+                        // if(baseoffset + threadoffset + k > 2048 && baseoffset + threadoffset + k < 3072){
+                        //     printf("lolcal warp offset:%u\n", baseoffset + threadoffset);
+                        // }
+                    }
+                    else if((threadIdx.x / threads_per_row) % 4 == 1){
+                        for(int k = 0; k < els_per_thread; k++)
+                            ldsPtr[baseoffset + threadoffset + k] -= 7;
+                    }
+                    else if((threadIdx.x / threads_per_row) % 4 == 2){
+                        for(int k = 0; k < els_per_thread; k++)
+                            ldsPtr[baseoffset + threadoffset + k] += 9;
+                    }
+                    else{
+                        for(int k = 0; k < els_per_thread; k++)
+                            ldsPtr[baseoffset + threadoffset + k] /= 3;
+                    }
+                }
+            }
 
             synchronize_workgroup();
             localReadAcc(fragsAcc,ldsPtr + ldsReadOffsetAcc,ldsld_new);
@@ -877,6 +814,7 @@ ROCWMMA_KERNEL void __launch_bounds__(256) gemm_rocwmma_d(uint32_t       m,
             // uniformFma(fragsD, alpha, fragsAcc, beta, fragsC);
             globalWriteD(d + MfmaFragDMap1d::fromMatrixCoord(warpTileCoord, ldd), fragsAcc, ldd);
         }
+        
     }
 }
 
@@ -1080,7 +1018,7 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
 
     // Setup and run reference computation
     std::vector<OutputT> matrixD_ref(m * n, std::numeric_limits<OutputT>::signaling_NaN());
-    gemm_cpu_h1<InputT, OutputT, ComputeT, DataLayoutA, DataLayoutB, DataLayoutC>(m,
+    gemm_cpu_h<InputT, OutputT, ComputeT, DataLayoutA, DataLayoutB, DataLayoutC>(m,
                                                                                  n,
                                                                                  k,
                                                                                  matrixA.data(),
@@ -1088,8 +1026,7 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
                                                                                  matrixD_ref.data(),
                                                                                  lda,
                                                                                  ldb,
-                                                                                 ldd,
-                                                                                 false);
+                                                                                 ldd);
 
     // printf("device result:\n");
     // for(int i = 0; i < m; i++)
@@ -1136,6 +1073,6 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
 
 int main()
 {
-    gemm_test(6400, 4096, 64, 2, 2);
+    gemm_test(2048, 2048, 512, 2, 2);
     return 0;
 }

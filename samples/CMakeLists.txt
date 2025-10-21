@@ -26,6 +26,8 @@
 
 set(ROCWMMA_SAMPLES_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
+set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+
 # Custom target to build all rocWMMA samples
 add_custom_target(rocwmma_samples)
 
@@ -35,7 +37,16 @@ function(add_rocwmma_sample TEST_TARGET TEST_SOURCE)
 
   list(APPEND TEST_SOURCE ${ARGN})
   add_executable(${TEST_TARGET} ${TEST_SOURCE})
-    target_compile_options(${TEST_TARGET} PRIVATE -UNDEBUG)
+    # target_compile_options(${TEST_TARGET} PRIVATE -UNDEBUG)
+    target_compile_options(${TEST_TARGET} PRIVATE
+    -UNDEBUG
+    # host 侧
+    $<$<COMPILE_LANGUAGE:CXX>:-g -O0 -fno-omit-frame-pointer -fno-inline>
+    # device 侧（hipcc 也吃 -g；这些选项会透传到设备编译）
+    $<$<COMPILE_LANGUAGE:HIP>:-g -O0 -fno-omit-frame-pointer -fno-inline>
+  )
+  target_link_options(${TEST_TARGET} PRIVATE -g)
+
   target_link_libraries(${TEST_TARGET} OpenMP::OpenMP_CXX "-L${HIP_CLANG_ROOT}/lib" "-Wl,-rpath=${HIP_CLANG_ROOT}/lib")
   target_link_libraries(${TEST_TARGET} rocwmma hiprtc::hiprtc)
   target_include_directories(${TEST_TARGET} PRIVATE
@@ -74,6 +85,8 @@ endfunction()
 # add_rocwmma_sample(perf_hgemm_partials ${CMAKE_CURRENT_SOURCE_DIR}/perf_hgemm_partials.cpp)
 add_rocwmma_sample(test1d ${CMAKE_CURRENT_SOURCE_DIR}/test_1dq.cpp)
 add_rocwmma_sample(st_to_lds ${CMAKE_CURRENT_SOURCE_DIR}/st_to_lds.cpp)
+add_rocwmma_sample(f2gemm ${CMAKE_CURRENT_SOURCE_DIR}/fusion2.cpp)
+add_rocwmma_sample(lds_softmax ${CMAKE_CURRENT_SOURCE_DIR}/lds_softmax.cpp)
 # add_rocwmma_sample(simple_dgemm ${CMAKE_CURRENT_SOURCE_DIR}/simple_dgemm.cpp)
 # add_rocwmma_sample(perf_dgemm ${CMAKE_CURRENT_SOURCE_DIR}/perf_dgemm.cpp)
 # add_rocwmma_sample(simple_sgemv ${CMAKE_CURRENT_SOURCE_DIR}/simple_sgemv.cpp)

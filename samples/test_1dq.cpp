@@ -782,9 +782,9 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
     // Fill outputs with NaN to catch contamination
     std::vector<OutputT> matrixD(m * n, std::numeric_limits<OutputT>::signaling_NaN());
 
-    fillRand(matrixA.data(), m, k);
-    fillRand(matrixB.data(), k, n);
-    fillRand(matrixC.data(), m, n);
+    newfillRand1(matrixA.data(), m, k);
+    newfillRand1(matrixB.data(), k, n);
+    newfillRand1(matrixC.data(), m, n);
 
     std::cout << "Initializing device data..." << std::endl;
 
@@ -946,6 +946,6 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
 
 int main()
 {
-    gemm_test(8960, 64, 8960, 2, 2);
+    gemm_test(8192, 8192, 128, 2, 2);
     return 0;
 }

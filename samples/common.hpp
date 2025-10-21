@@ -29,6 +29,9 @@
 
 #include <iostream>
 #include <mutex>
+#include <random>
+#include <type_traits>
+#include <omp.h>
 
 // Helper macro for HIP errors
 #ifndef CHECK_HIP_ERROR
@@ -223,6 +226,66 @@ __host__ static inline void fillRand(DataT* mat, uint32_t m, uint32_t n)
     }
 }
 
+template <typename DataT>
+__host__ inline void newfillRand(DataT* mat, uint32_t m, uint32_t n)
+{
+    #pragma omp parallel
+    {
+        // 每线程的独立 RNG：用线程号和时间混合种子
+        std::mt19937 gen(
+            static_cast<unsigned>(time(nullptr)) ^ (0x9e3779b9u * omp_get_thread_num()));
+        std::uniform_int_distribution<unsigned> dist(1, 212);
+
+        #pragma omp for
+        for (int i = 0; i < static_cast<int>(m); ++i)
+        {
+            unsigned rando = dist(gen);
+            for (uint32_t j = 0; j < n; ++j)
+            {
+                unsigned value = (rando + j);
+                DataT v = static_cast<DataT>(value);
+                if constexpr (std::is_signed_v<DataT>) {
+                    if ((value % 3u) == 0u) v = -v;
+                }
+                mat[i * n + j] = v;
+            }
+        }
+    }
+}
+
+static inline uint32_t splitmix32(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    x = x ^ (x >> 31);
+    return static_cast<uint32_t>(x);
+}
+
+template <typename DataT>
+__host__ inline void newfillRand1(DataT* mat,
+                                 uint32_t m, uint32_t n,
+                                 uint32_t seed = 12345678u)
+{
+    auto idx = [](uint32_t r, uint32_t c, uint32_t ld){ return r * ld + c; };
+
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < static_cast<int>(m); ++i)
+    {
+        // 行稳定的“随机起点” ∈ [1,212]
+        uint32_t rando = (splitmix32((static_cast<uint64_t>(seed) << 32) ^ static_cast<uint32_t>(i+1)) % 212u) + 1u;
+
+        for (uint32_t j = 0; j < n; ++j)
+        {
+            uint32_t value = rando + j;  // 线性递增
+            DataT v = static_cast<DataT>(value);
+            if constexpr (std::is_signed_v<DataT>) {
+                if ((value % 3u) == 0u) v = -v;
+            }
+            mat[i*n+j] = v;
+        }
+    }
+}
+
 template <typename InputT,
           typename OutputT,
           typename ComputeT,
@@ -259,6 +322,62 @@ __host__ void gemm_cpu_h(uint32_t       m,
                 accum += static_cast<ComputeT>(a[aIndex(i, h, lda)])
                          * static_cast<ComputeT>(b[bIndex(h, j, ldb)]);
             }
+            // if(i % 4 == 0){
+            //     accum *= 2;
+            // }
+            // else if(i % 4 == 1){
+            //     accum -= 7;
+            // }
+            // else if(i % 4 == 2){
+            //     accum += 9;
+            // }
+            // else{
+            //     accum += 3;
+            // }
+            accum %= 220;
+            d[dIndex(i, j, ldd)] = accum;
+        }
+    }
+}
+
+template <typename InputT,
+          typename OutputT,
+          typename ComputeT,
+          typename LayoutA,
+          typename LayoutB,
+          typename LayoutC,
+          typename LayoutD = LayoutC>
+__host__ void gemm_cpu_h1(uint32_t       m,
+                         uint32_t       n,
+                         uint32_t       k,
+                         InputT const*  a,
+                         InputT const*  b,
+                         OutputT*       d,
+                         uint32_t       lda,
+                         uint32_t       ldb,
+                         uint32_t       ldd,
+                         bool           flag)
+{
+    auto rowMjr = [](uint32_t row, uint32_t col, uint32_t ld) { return row * ld + col; };
+    auto colMjr = [](uint32_t row, uint32_t col, uint32_t ld) { return col * ld + row; };
+
+    auto aIndex = std::is_same<LayoutA, rocwmma::row_major>::value ? rowMjr : colMjr;
+    auto bIndex = std::is_same<LayoutB, rocwmma::row_major>::value ? rowMjr : colMjr;
+    auto dIndex = std::is_same<LayoutD, rocwmma::row_major>::value ? rowMjr : colMjr;
+
+#pragma omp parallel for
+    for(int i = 0; i < m; ++i)
+    {
+#pragma omp parallel for
+        for(int j = 0; j < n; ++j)
+        {
+            ComputeT accum = static_cast<ComputeT>(0);
+            for(int h = 0; h < k; ++h)
+            {
+                accum += static_cast<ComputeT>(a[aIndex(i, h, lda)])
+                         * static_cast<ComputeT>(b[bIndex(h, j, ldb)]);
+            }
+            if(flag)    accum %= 126;
             d[dIndex(i, j, ldd)] = accum;
         }
     }
@@ -306,18 +425,18 @@ __host__ void gemm_cpu_h(uint32_t       m,
                 accum += static_cast<ComputeT>(a[aIndex(i, h, lda)])
                          * static_cast<ComputeT>(b[bIndex(h, j, ldb)]);
             }
-            if(i % 4 == 0){
-                accum *= 2;
-            }
-            else if(i % 4 == 1){
-                accum -= 7;
-            }
-            else if(i % 4 == 2){
-                accum += 9;
-            }
-            else{
-                accum /= 3;
-            }
+            // if(i % 4 == 0){
+            //     accum *= 2;
+            // }
+            // else if(i % 4 == 1){
+            //     accum -= 7;
+            // }
+            // else if(i % 4 == 2){
+            //     accum += 9;
+            // }
+            // else{
+            //     accum /= 3;
+            // }
             d[dIndex(i, j, ldd)] = static_cast<OutputT>(
                 alpha * accum + beta * static_cast<ComputeT>(c[cIndex(i, j, ldc)]));
         }
