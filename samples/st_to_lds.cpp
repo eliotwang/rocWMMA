@@ -804,8 +804,18 @@ ROCWMMA_KERNEL void __launch_bounds__(256) gemm_rocwmma_d(uint32_t       m,
 
             auto ldsReadOffsetAcc = get<0>(localWarpOffset) * ldsld_new + get<1>(localWarpOffset);
 
-            localWriteAcc(fragsAcc,ldsPtr + ldsReadOffsetAcc,ldsld_new);
-            synchronize_workgroup();
+            for(int i = 0; i < BLOCKS_X; i++)
+            {
+                for(int j = 0; j < BLOCKS_Y; j++)
+                {
+                    for(int k = 0; k < fragsAcc[i][j].num_elements; k++)
+                    {
+                        fragsAcc[i][j].x[k] = threadIdx.x * 1000 + k;
+                    }
+                }
+            }
+            // localWriteAcc(fragsAcc,ldsPtr + ldsReadOffsetAcc,ldsld_new);
+            // synchronize_workgroup();
             
             // if(blockIdx.x == 0 && iter == 0)
             // {
@@ -837,39 +847,33 @@ ROCWMMA_KERNEL void __launch_bounds__(256) gemm_rocwmma_d(uint32_t       m,
             //         if((threadIdx.x / threads_per_row) % 4 == 0){
             //             for(int k = 0; k < els_per_thread; k++)
             //             {
-            //                 ldsPtr[baseoffset + threadoffset + k] *= 2;
-            //                 ldsPtr[baseoffset + threadoffset + k] %= 220;
+            //                 ldsPtr[baseoffset + threadoffset + k] = ldsPtr[baseoffset + threadoffset + k]*1000+k;
+                            
             //             }
-            //             // if(baseoffset + threadoffset + k > 2048 && baseoffset + threadoffset + k < 3072){
-            //             //     printf("lolcal warp offset:%u\n", baseoffset + threadoffset);
-            //             // }
             //         }
             //         else if((threadIdx.x / threads_per_row) % 4 == 1){
             //             for(int k = 0; k < els_per_thread; k++)
             //             {
-            //                 ldsPtr[baseoffset + threadoffset + k] -= 7;
-            //                 ldsPtr[baseoffset + threadoffset + k] %= 220;
+            //                 ldsPtr[baseoffset + threadoffset + k] = ldsPtr[baseoffset + threadoffset + k]*1000+k;
             //             }
             //         }
             //         else if((threadIdx.x / threads_per_row) % 4 == 2){
             //             for(int k = 0; k < els_per_thread; k++)
             //             {
-            //                 ldsPtr[baseoffset + threadoffset + k] += 9;
-            //                 ldsPtr[baseoffset + threadoffset + k] %= 220;
+            //                 ldsPtr[baseoffset + threadoffset + k] = ldsPtr[baseoffset + threadoffset + k]*1000+k;
             //             }
             //         }
             //         else{
             //             for(int k = 0; k < els_per_thread; k++)
             //             {
-            //                 ldsPtr[baseoffset + threadoffset + k] += 3;
-            //                 ldsPtr[baseoffset + threadoffset + k] %= 220;
+            //                 ldsPtr[baseoffset + threadoffset + k] = ldsPtr[baseoffset + threadoffset + k]*1000+k;
             //             }
             //         }
             //     }
             // }
 
-            synchronize_workgroup();
-            localReadAcc(fragsAcc,ldsPtr + ldsReadOffsetAcc,ldsld_new);
+            // synchronize_workgroup();
+            // localReadAcc(fragsAcc,ldsPtr + ldsReadOffsetAcc,ldsld_new);
             ///
             /// D = alpha * accum + beta * C
             ///
@@ -1080,7 +1084,7 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
 
     // Setup and run reference computation
     std::vector<OutputT> matrixD_ref(m * n, std::numeric_limits<OutputT>::signaling_NaN());
-    gemm_cpu_h1<InputT, OutputT, ComputeT, DataLayoutA, DataLayoutB, DataLayoutC>(m,
+    gemm_cpu_h<InputT, OutputT, ComputeT, DataLayoutA, DataLayoutB, DataLayoutC>(m,
                                                                                  n,
                                                                                  k,
                                                                                  matrixA.data(),
@@ -1088,28 +1092,27 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
                                                                                  matrixD_ref.data(),
                                                                                  lda,
                                                                                  ldb,
-                                                                                 ldd,
-                                                                                 false);
+                                                                                 ldd);
 
-    // printf("device result:\n");
-    // for(int i = 0; i < m; i++)
-    // {
-    //     for(int j = 0; j < n; j++)
-    //     {
-    //         printf("%d ",matrixD[i * n + j]);
-    //     }
-    //     printf("\n");
-    // }
+    printf("device result:\n");
+    for(int i = 0; i < m; i++)
+    {
+        for(int j = 0; j < n; j++)
+        {
+            printf("%d ",matrixD[i * n + j]);
+        }
+        printf("\n");
+    }
 
-    // printf("host result:\n");
-    // for(int i = 0; i < m; i++)
-    // {
-    //     for(int j = 0; j < n; j++)
-    //     {
-    //         printf("%d ",matrixD_ref[i * n + j]);
-    //     }
-    //     printf("\n");
-    // }
+    printf("host result:\n");
+    for(int i = 0; i < m; i++)
+    {
+        for(int j = 0; j < n; j++)
+        {
+            printf("%d ",matrixD_ref[i * n + j]);
+        }
+        printf("\n");
+    }
     auto res = compareEqual(matrixD.data(), matrixD_ref.data(), m * n);
 
     if(std::get<0>(res) == false)
@@ -1136,6 +1139,6 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
 
 int main()
 {
-    gemm_test(6400, 4096, 64, 2, 2);
+    gemm_test(64, 64, 64, 2, 2);
     return 0;
 }

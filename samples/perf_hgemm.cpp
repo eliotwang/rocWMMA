@@ -227,7 +227,7 @@ namespace gfx9Params
     {
         ROCWMMA_M = 16u,
         ROCWMMA_N = 16u,
-        ROCWMMA_K = 128u,
+        ROCWMMA_K = 16u,
         BLOCKS_X  = 2u,
         BLOCKS_Y  = 2u,
         TBLOCK_X  = 128u,
@@ -261,14 +261,14 @@ using namespace gfx11Params;
 /// Types and Data Layouts
 ///
 
-using InputT   = float8_fnuz_t;
-using OutputT  = float32_t;
-using ComputeT = float32_t;
+using InputT   = int8_t;
+using OutputT  = int32_t;
+using ComputeT = int32_t;
 
-using DataLayoutA   = row_major;
-using DataLayoutB   = col_major;
+using DataLayoutA   = col_major;
+using DataLayoutB   = row_major;
 using DataLayoutC   = row_major;
-using DataLayoutLds = row_major;
+using DataLayoutLds = col_major;
 
 ///
 /// Fragment types
@@ -943,7 +943,7 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
 int main()
 {
     std::cout << "---------------------------------------" << std::endl;
-    gemm_test(2048, 1024, 1024, 2, 2);
+    gemm_test(20480, 20480, 128, 2, 2);
     // std::cout << "---------------------------------------" << std::endl;
     // gemm_test(8992, 64, 8992, 2, 2);
     // std::cout << "---------------------------------------" << std::endl;

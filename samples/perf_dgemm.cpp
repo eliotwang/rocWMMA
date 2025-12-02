@@ -201,8 +201,8 @@ using InputT   = float64_t;
 using OutputT  = float64_t;
 using ComputeT = float64_t;
 
-using DataLayoutA   = col_major;
-using DataLayoutB   = row_major;
+using DataLayoutA   = row_major;
+using DataLayoutB   = col_major;
 using DataLayoutC   = row_major;
 using DataLayoutLds = col_major;
 

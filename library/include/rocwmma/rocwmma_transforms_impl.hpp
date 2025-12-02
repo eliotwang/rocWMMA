@@ -28,7 +28,7 @@
 
 #include "internal/transforms.hpp"
 #include "rocwmma_transforms.hpp"
-
+#include <cstdio>
 namespace rocwmma
 {
     namespace detail
@@ -232,6 +232,7 @@ namespace rocwmma
                     int> = 0>
             ROCWMMA_DEVICE constexpr static inline decltype(auto) exec(FragT const& frag)
             {
+                // printf("input output register match\n");
                 return reinterpret_cast<FragOut const&>(frag);
             }
 
@@ -244,6 +245,7 @@ namespace rocwmma
                     int> = 0>
             ROCWMMA_DEVICE constexpr static inline auto exec(FragT const& frag)
             {
+                // printf("input output register not match\n");
                 // TODO: Make sure to use coop configs to get the right MaxVW!!!
                 using IOConfigCoop           = GetCoopIOConfig_t<FragIn, WaveCount>;
                 constexpr uint32_t BlockDim  = IOConfigCoop::IOShape::BlockDim;

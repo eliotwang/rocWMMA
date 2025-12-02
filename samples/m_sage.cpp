@@ -36,40 +36,37 @@
 #include <rocwmma/rocwmma_transforms.hpp>
 
 #include "common.hpp"
+// #include <stdio.h>
 /* Motivation
 *
-* For this particular fusion 2 GEMM kernel:
-* D = A x B x C
-* 
-* A, B, C= input tiles of MxK, KxN and NxK, respectively
-* D = final output tile, MxN
-* (M, N and K are block dimensions)
-*
-* For A x B phase, high performance can be
+* For this particular GEMM kernel, high performance can be
 * achieved through two general principles:
 * 1) Data re-use
 * 2) Latency hiding
-* And for S (the result of AxB) x C, the current performance isn’t particularly good.
-* This sample showcases fusing two matmuls and serves as a basic reference for users opting 
-* to use rocWMMA for attention-style architectures.
 *
-* Unlike the other samples, we use a 1D grid instead of a 2D grid. 
-* Since tensors in neural networks are typically 4-D (B, H, N, D or B, N, H, D),
-* with batch and head usually serving as the parallel dimensions,
-* we parallelize only along the M dimension and handle the N/K dimensions via loops.
+* From the simple_gemm implementation, we know that the GEMM
+* equation takes the form:
+*
+* D = alpha * AxB + beta * C, where
+*
+* A, B = input tiles of MxK and KxN, respectively
+* C = input tile of MxN and
+* D = final output tile, MxN
+* alpha, beta are scalar factors
+* (M, N and K are block dimensions)
 *
 * In the simple_gemm sample, each warp is responsible for computing
 * one output D tile of the final result. In the current sample, each
 * warp is now responsible for computing multiple D tiles, what we
 * might call a Warp Tile. Because Warp Tile blocks share data locality
 * in either the same row or column direction, warps can re-use input
-* data from A, B and C as they step through the K/N dimension for each block.
+* data from A and B as they step through the K dimension for each block.
 *
 * Moreover, Warp Tiles processed by warps in a thread block
 * have common locality in the larger Macro Tile. In the Global D layout
 * shown below, data re-use opportunities await in D tiles aligned in the
-* same rows / columns. These will pass over the same input A/B/C values as
-* they march through the K/N dimension.
+* same rows / columns. These will pass over the same input A/B values as
+* they march through the K dimension.
 *
 * Block size:      (BlockM x BlockN)
 * Warp tile size:  (BlocksX * BlockSize.x) x (BlocksY * BlockSize.y)
@@ -77,7 +74,6 @@
 *
 * Wave data share input A: same row
 * Wave data share input B: same col
-* Wave data share input C: same col
 *
 * Global D layout & warp assignment for BlocksX = BlocksY = 2, 2x2 Warps
 *
@@ -122,54 +118,34 @@
 *
 *       Start
 *         |
+*   Pre-Fetch Global A/B for K0
+*         |
+*   Store LDS buffer0
+*         |
 *         v
-*   Loop: ab_i = 0:B blocks
-*   ^            |
-*   |     Pre-Fetch Global A/B for K0
-*   |            |
-*   |     Store LDS buffer0
-*   |            |
-*   |            v
-*   |     Loop: i = 1:K-1
-*   |     ^         |
-*   |     |    Fetch Global A/B i+1; store LDS Buffer 1
-*   |     |         |
-*   |     |    Load LDS buffer0; Accum A x B
-*   |     |         |
-*   |     |    Swap buffer0, buffer1
-*   |     |         |
-*   |     |         |
-*   |     end_loop <-
-*   |            |
-*   |     type cast: int32 -> int8
-*   |            |
-*   |     Loop: sc_i = 0:C blocks
-*   |     ^            |
-*   |     |    Loop: i = 0:K-1 
-*   |     |    ^         |
-*   |     |    |   Fetch Global C i; store LDS Buffer 1
-*   |     |    |         |
-*   |     |    |   C Load LDS buffer1; S Load LDS buffer0; Accum S x C
-*   |     |    |         |
-*   |     |    |         |
-*   |     |    end_loop <-
-*   |     |         |
-*   |     |         |
-*   |     end_loop <-
-*   |            |
-*   |            |
-*   -- end_loop <-
-*   Loop: sc_i = 0:C blocks
-*   ^            |
-*   |      Write D tile sc_i
-*   |            |
-*   |            |
-*   -- end_loop <-
+*   Loop: i = 1:K-1
+*   ^         |
+*   |    Fetch Global A/B i+1; store LDS Buffer 1
+*   |         |
+*   |    Load LDS buffer0; Accum A x B
+*   |         |
+*   |    Swap buffer0, buffer1
+*   |         |
+*   |         |
+*   end_loop <-
+*         |
+*   Load LDS buffer0; Accum A x B
+*         |
+*   Load Global C Tile
+*         |
+*   D = alpha * AccumAB + beta * C
+*         |
+*   Write D Tile
 *         |
 *         v
 *        End
 *
-* Lds Mapping in AxB phase:
+* Lds Mapping
 * Buffer Width = LDS Width = BlockK
 * Matrix geometry for inputs A and B have a common dimension (BlockK).
 * We can fix one of the LDS dimensions to BlockK (in this case the width),
@@ -178,12 +154,6 @@
 *
 * Fragments of B must be transposed to fit this geometry,
 * and both fragments from A and B must accomodate LDS data layout.
-*
-* Lds Mapping in AxB phase:
-* After AxB, we reinterpret_cast LDS width = MACRO_TILE_Y, height = MACRO_TILE_X
-* to store result of A block x b block.
-* And the rest LDS is used to store GlobalRead Tile
-* (In fact, there is some wastage of LDS space.)
 *
 * Local Layout (LDS):
 *
@@ -216,34 +186,6 @@
 *          |         .
 *          |         .          ...  ...  ...  ...        BY-1 (T)
 *          -->                                           (MacroTileX + MacroTileY - 1, BlockK -1)
-*
-*                                     |--- LDS height = Macro Tile Y-------|
-*      _ _   _ _      _ _          ___  ________ ________ ________ ________
-*       |     |        |            ^  |        |        |        |        |
-*       | Wave| BlockM |   BlockM   |  |        |        |        |        |
-*       | Tile|       _|_     x     |  |__ __ _ | _ __ __|__ __ _ | _ __ __|
-*       |  X  |            BlocksX  |  |        |        |        |        |
-* Macro |     |                     |  |        |        |        |        |
-* TileX |    _|_                   _v_ |________|________|________|________|
-*       |                           ^  |        |        |        |        |
-*       |                  BlockM   |  |        |        |        |        |
-*       |                     x     |  |__ __ _ | _ __ __|__ __ _ | _ __ __|
-*       |                  BlocksX  |  |        |        |        |        |
-*       |                           |  |        |        |        |        |
-*      _|_                         _v_ |________|________|________|________|
-*       |     |        |            ^  |        |                          |
-*       | Wave| BlockM |   BlockM   |  |        |                          |
-*       | Tile|       _|_     x     |  |__ __ _ |                          |
-*       |  X  |            BlocksX  |  |        |                          |
-* Macro |     |                     |  |        |            Not           |
-* TileC |    _|_                   _v_ |________|            Used          |
-*       |                           ^  |        |                          |
-*       |                  BlockM   |  |        |                          |
-*       |                     x     |  |__ __ _ |                          |
-*       |                  BlocksX  |  |        |                          |
-*       |                           |  |        |                          |
-*      _|_                         _v_ |________|________ ________ ________|
-*
 *
 * Depending on the locality of the block being processed, warps load the corresponding
 * A and B inputs from LDS buffer and use them for the accumulation of AxB calculations.
@@ -288,9 +230,9 @@ namespace gfx9Params
         ROCWMMA_N = 16u,
         ROCWMMA_K = 32u,
         BLOCKS_X  = 2u,
-        BLOCKS_Y  = 4u,
-        TBLOCK_X  = 256u,
-        TBLOCK_Y  = 1u,
+        BLOCKS_Y  = 2u,
+        TBLOCK_X  = 128u,
+        TBLOCK_Y  = 2u,
         WARP_SIZE = Constants::AMDGCN_WAVE_SIZE_64
     };
 }
@@ -310,6 +252,9 @@ namespace gfx11Params
     };
 }
 
+constexpr float log2e = 1.44269504088896340736f;
+constexpr float log2e_recp = 1.0f / log2e;
+
 #if(ROCWMMA_ARCH_GFX9)
 using namespace gfx9Params;
 #else
@@ -321,9 +266,10 @@ using namespace gfx11Params;
 ///
 
 using InputT   = int8_t;
-using InputTV   = int8_t;
+using InputTV   = hip_fp8_e4m3_fnuz;
 using OutputT  = int32_t;
 using ComputeT = int32_t;
+using ComputeTV = float32_t;
 using LDST = float32_t;
 using LDST_new = hip_fp8_e4m3_fnuz;
 
@@ -331,7 +277,6 @@ using DataLayoutA   = row_major;
 using DataLayoutB   = col_major;
 using DataLayoutC   = row_major;
 using DataLayoutLds = col_major;
-using DataLayoutS   = row_major;
 using DataLayoutV   = col_major;
 // can't modify
 using DataLayoutLds_new = row_major;
@@ -361,20 +306,21 @@ using MfmaFragB   = fragment<matrix_b, ROCWMMA_M, ROCWMMA_N, ROCWMMA_K, InputT, 
 using MfmaFragC   = fragment<accumulator, ROCWMMA_M, ROCWMMA_N, ROCWMMA_K, OutputT, DataLayoutC>;
 using MfmaFragD   = MfmaFragC;
 using MfmaFragAcc = fragment<accumulator, ROCWMMA_M, ROCWMMA_N, ROCWMMA_K, ComputeT,DataLayoutC>;
+using MfmaFragAccf32 = fragment<accumulator, ROCWMMA_M, ROCWMMA_N, ROCWMMA_K, ComputeTV,DataLayoutC>;
 
 using MfmaFragF8 = fragment<matrix_a, ROCWMMA_M, ROCWMMA_N, MACRO_TILE_Y, hip_fp8_e4m3_fnuz,DataLayoutC>;
 
-using MfmaFragAcc2 = fragment<accumulator, ROCWMMA_M, ROCWMMA_N, ROCWMMA_K, InputTV,DataLayoutS>;
+using MfmaFragAcc2 = fragment<accumulator, ROCWMMA_M, ROCWMMA_N, ROCWMMA_K, InputTV,DataLayoutA>;
 using MfmaFragAcc2_1d = fragment<accumulator, ROCWMMA_M,ROCWMMA_N, MACRO_TILE_Y, OutputT,DataLayoutC>;
 
-using MfmaFragS   = fragment<matrix_a, ROCWMMA_M, ROCWMMA_N, ROCWMMA_K, InputTV, DataLayoutS>;
+using MfmaFragS   = fragment<matrix_a, ROCWMMA_M, ROCWMMA_N, ROCWMMA_K, InputTV, DataLayoutA>;
 using MfmaFragV   = fragment<matrix_b, ROCWMMA_M, ROCWMMA_N, ROCWMMA_K, InputTV, DataLayoutV>;
 
 // Global read (macro tile)
 using GRBuffA = fragment<matrix_a, MACRO_TILE_X, ROCWMMA_N, ROCWMMA_K, InputT, DataLayoutA>;
 using GRBuffB = fragment<matrix_b, ROCWMMA_M, MACRO_TILE_Y, ROCWMMA_K, InputT, DataLayoutB>;
 
-using GRBuffS = fragment<matrix_a, MACRO_TILE_X, ROCWMMA_N, ROCWMMA_K, InputTV, DataLayoutS>;
+using GRBuffS = fragment<matrix_a, MACRO_TILE_X, ROCWMMA_N, ROCWMMA_K, InputTV, DataLayoutA>;
 using GRBuffV = fragment<matrix_b, ROCWMMA_M, MACRO_TILE_Y, ROCWMMA_K, InputTV, DataLayoutV>;
 
 // Local write of global buffers (macro tile)
@@ -397,6 +343,7 @@ using LRFragS = ApplyDataLayout_t<MfmaFragS, DataLayoutLds_new>;
 using LRFragV = ApplyDataLayout_t<ApplyTranspose_t<MfmaFragV>, DataLayoutLds_new>;
 
 using LRFragAcc2 = ApplyDataLayout_t<MfmaFragAcc2, DataLayoutLds_new>;
+using LRFragAccf32 = ApplyDataLayout_t<MfmaFragAccf32, DataLayoutLds_new>;
 // #endif // (ROCWMMA_ARCH_GFX9 || ROCWMMA_ARCH_GFX11)
 
 ///
@@ -501,7 +448,7 @@ ROCWMMA_DEVICE static inline void
     {
         LRFragS tmp;
         load_matrix_sync(tmp, ldsAddrS, ldsld);
-        fragsS[i] = applyDataLayout<DataLayoutS>(tmp);
+        fragsS[i] = applyDataLayout<DataLayoutA>(tmp);
 
         ldsAddrS += blockStep;
     }
@@ -620,10 +567,10 @@ ROCWMMA_DEVICE static inline void fill(FragT (&frags)[BLOCKS_X][BLOCKS_Y],
 }
 
 ROCWMMA_DEVICE static inline void
-    localWriteAcc(MfmaFragAcc2 (&fragsAcc)[BLOCKS_X][BLOCKS_Y], InputT * ldsAddrAcc, uint32_t ldsld)
+    localWriteAcc(MfmaFragAccf32 (&fragsAcc)[BLOCKS_X][BLOCKS_Y], ComputeTV * ldsAddrAcc, uint32_t ldsld)
 {
-    using FragShape = GetIOShape_t<LRFragAcc2>;
-    using Mapper1d  = GetDataLayout_t<LRFragAcc2>;
+    using FragShape = GetIOShape_t<LRFragAccf32>;
+    using Mapper1d  = GetDataLayout_t<LRFragAccf32>;
 
     auto blockStepX = Mapper1d::fromMatrixCoord(make_coord2d(FragShape::BlockHeight, 0u), ldsld);
     auto blockStepY = Mapper1d::fromMatrixCoord(make_coord2d(0u, FragShape::BlockWidth), ldsld);
@@ -639,6 +586,42 @@ ROCWMMA_DEVICE static inline void
             offsetY += blockStepY;
         }
         ldsAddrAcc += blockStepX;
+    }
+}
+
+ROCWMMA_DEVICE static inline void
+    localWriteOut(MfmaFragAccf32 (&fragsAcc)[BLOCKS_Y], ComputeTV * ldsAddrAcc, uint32_t ldsld)
+{
+    using FragShape = GetIOShape_t<LRFragAccf32>;
+    using Mapper1d  = GetDataLayout_t<LRFragAccf32>;
+
+    // auto blockStepX = Mapper1d::fromMatrixCoord(make_coord2d(FragShape::BlockHeight, 0u), ldsld);
+    auto blockStepY = Mapper1d::fromMatrixCoord(make_coord2d(0u, FragShape::BlockWidth), ldsld);
+
+    auto offsetY = 0u;
+#pragma unroll
+    for(int j = 0; j < BLOCKS_Y; j++)
+    {
+        store_matrix_sync(ldsAddrAcc + offsetY, fragsAcc[i][j], ldsld);
+        offsetY += blockStepY;
+    }
+}
+
+
+ROCWMMA_DEVICE static inline void
+    localReadOut(MfmaFragAccf32 (&fragsAcc)[BLOCKS_Y], OutputT const* ldsAddrAcc, uint32_t ldsld)
+{
+    using FragShape = GetIOShape_t<LRFragAcc>;
+    using Mapper1d  = GetDataLayout_t<LRFragAcc>;
+
+    auto blockStepY = Mapper1d::fromMatrixCoord(make_coord2d(0u, FragShape::BlockWidth), ldsld);
+
+    auto offsetY = 0u;
+#pragma unroll
+    for(int j = 0; j < BLOCKS_Y; j++)
+    {
+        load_matrix_sync(fragsAcc[i][j], ldsAddrAcc + offsetY, ldsld);
+        offsetY += blockStepY;
     }
 }
 
@@ -668,13 +651,13 @@ ROCWMMA_DEVICE static inline void
 
 ROCWMMA_DEVICE static inline void
 convertS32toF32(MfmaFragAcc  (&frags_i32)[BLOCKS_X][BLOCKS_Y],
-                   MfmaFragAcc2 (&frags_f32)[BLOCKS_X][BLOCKS_Y])
+                   MfmaFragAccf32 (&frags_f32)[BLOCKS_X][BLOCKS_Y])
 {
 #pragma unroll
     for (int i = 0; i < BLOCKS_X; ++i) {
 #pragma unroll
         for (int j = 0; j < BLOCKS_Y; ++j) {
-#pragma unroll
+// #pragma unroll
             for (int k = 0; k < frags_i32[i][j].num_elements; ++k) {
                 frags_f32[i][j].x[k] = __int2float_rz(frags_i32[i][j].x[k] % 220);
             }
@@ -683,34 +666,49 @@ convertS32toF32(MfmaFragAcc  (&frags_i32)[BLOCKS_X][BLOCKS_Y],
 }
 
 ROCWMMA_DEVICE static inline void
-convertI32toI8(MfmaFragAcc  (&frags_i32)[BLOCKS_X][BLOCKS_Y],
-                   MfmaFragAcc2 (&frags_i8)[BLOCKS_X][BLOCKS_Y])
+convertS32toF32(MfmaFragAccf32  (&frags_f32)[BLOCKS_X][BLOCKS_Y],
+                   MfmaFragAccf32 (&frags_f32)[BLOCKS_X][BLOCKS_Y])
 {
 #pragma unroll
     for (int i = 0; i < BLOCKS_X; ++i) {
 #pragma unroll
         for (int j = 0; j < BLOCKS_Y; ++j) {
-#pragma unroll
+// #pragma unroll
             for (int k = 0; k < frags_i32[i][j].num_elements; ++k) {
-                frags_i8[i][j].x[k] = static_cast<int8_t>(frags_i32[i][j].x[k] % 126);
-                // printf("before:%d,after:%d\n",frags_i32[i][j].x[k] % 126,frags_i8[i][j].x[k]);
+                frags_f32[i][j].x[k] = __int2float_rz(frags_i32[i][j].x[k] % 220);
             }
         }
     }
 }
+// ROCWMMA_DEVICE static inline void
+// convertI32toI8(MfmaFragAcc  (&frags_i32)[BLOCKS_X][BLOCKS_Y],
+//                    MfmaFragAcc2 (&frags_i8)[BLOCKS_X][BLOCKS_Y])
+// {
+// #pragma unroll
+//     for (int i = 0; i < BLOCKS_X; ++i) {
+// #pragma unroll
+//         for (int j = 0; j < BLOCKS_Y; ++j) {
+// #pragma unroll
+//             for (int k = 0; k < frags_i32[i][j].num_elements; ++k) {
+//                 frags_i8[i][j].x[k] = static_cast<int8_t>(frags_i32[i][j].x[k] % 126);
+//                 // printf("before:%d,after:%d\n",frags_i32[i][j].x[k] % 126,frags_i8[i][j].x[k]);
+//             }
+//         }
+//     }
+// }
 
-ROCWMMA_DEVICE static inline void
-convertF32toF8e4m3fnuz(MfmaFragAcc2_1d  (&frags_f32)[BLOCKS_X],
-                   MfmaFragF8 (&frags_f8)[BLOCKS_X])
-{
-#pragma unroll
-    for (int i = 0; i < BLOCKS_X; ++i) {
-#pragma unroll
-        for (int k = 0; k < frags_f8[i].num_elements; ++k) {
-            frags_f8[i].x[k] = __hip_cvt_float_to_fp8(frags_f32[i].x[k], __HIP_SATFINITE, __HIP_E4M3_FNUZ);
-        }
-    }
-}
+// ROCWMMA_DEVICE static inline void
+// convertF32toF8e4m3fnuz(MfmaFragAcc2_1d  (&frags_f32)[BLOCKS_X],
+//                    MfmaFragF8 (&frags_f8)[BLOCKS_X])
+// {
+// #pragma unroll
+//     for (int i = 0; i < BLOCKS_X; ++i) {
+// #pragma unroll
+//         for (int k = 0; k < frags_f8[i].num_elements; ++k) {
+//             frags_f8[i].x[k] = __hip_cvt_float_to_fp8(frags_f32[i].x[k], __HIP_SATFINITE, __HIP_E4M3_FNUZ);
+//         }
+//     }
+// }
 
 ROCWMMA_DEVICE static inline void svgemm(MfmaFragAcc (&fragsAccOut)[BLOCKS_X][BLOCKS_Y],
                                        MfmaFragS const (&fragsA)[BLOCKS_X],
@@ -769,45 +767,55 @@ ROCWMMA_DEVICE static inline void uniformFma(MfmaFragD (&fragsD)[BLOCKS_X][BLOCK
     }
 }
 
-template<int SV_ITERS>
-ROCWMMA_KERNEL void __launch_bounds__(256) gemm_rocwmma_d(uint32_t       m,
-                                                          uint32_t       n,
-                                                          uint32_t       k,
-                                                          InputT const*  a,
-                                                          InputT const*  b,
-                                                          InputTV const*  v,
-                                                          OutputT const* c,
-                                                          OutputT*       d,
-                                                          uint32_t       lda,
-                                                          uint32_t       ldb,
-                                                          uint32_t       ldv,
-                                                          uint32_t       ldd)
+template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K, uint32_t head_dim, DataType DTypeQK, QuantGranularity Q_GRAN, QuantGranularity K_GRAN, int SV_ITERS,
+        typename DTypeSVAccum = float, bool use_inst_buffer = false, typename DTypeOut = half, ComputeUnit DenominatorAccumUnit, MaskMode mask_mode = MaskMode::kNone, bool return_lse = false, bool fuse_v_scale=false, bool fuse_v_mean=false, bool use_pv_fp16_accu=false>
+ROCWMMA_KERNEL void __launch_bounds__(256) qk_int_sv_f8_attn_kernel(uint32_t       m,
+                                                                    uint32_t       n,
+                                                                    uint32_t       k,
+                                                                    InputTV const*  v,
+                                                                    uint32_t       lda,
+                                                                    uint32_t       ldb,
+                                                                    uint32_t       ldv,
+                                                                    uint32_t       ldd,
+    int8_t *__restrict__ Q, int8_t *__restrict__ K, int8_t *__restrict__ V, DTypeOut *__restrict__ O, float *__restrict__ Lse,
+    float *__restrict__ Q_scale, float *__restrict__ K_scale, float *__restrict__ V_scale, float *__restrict__ V_mean,
+    const uint32_t qo_len, const uint32_t kv_len, const uint32_t num_kv_groups,
+    const uint32_t stride_bz_q, const uint32_t stride_seq_q, const uint32_t stride_h_q, 
+    const uint32_t stride_bz_k, const uint32_t stride_seq_k, const uint32_t stride_h_k,
+    const uint32_t stride_bz_v, const uint32_t stride_h_v, const uint32_t stride_d_v,
+    const uint32_t stride_bz_o, const uint32_t stride_seq_o, const uint32_t stride_h_o,
+    float sm_scale)
 {
     if constexpr(!ROCWMMA_ARCH_HOST)
     {
-        // if(blockIdx.x == 0 && threadIdx.x == 0)
-        //     printf("wave size:%u\n",WARP_SIZE);
         ///
         /// 2D matrix coordinate setup
         ///
 
         // Tile Sizes
-        constexpr auto warpTileSize  = make_coord2d(WARP_TILE_X, WARP_TILE_Y);
-        constexpr auto macroTileSize = make_coord2d(MACRO_TILE_X, MACRO_TILE_Y);
+        constexpr auto warpTileSize  = make_coord2d(WARP_TILE_X, WARP_TILE_Y);  //(64,64)
+        constexpr auto macroTileSize = make_coord2d(MACRO_TILE_X, MACRO_TILE_Y);//(128,128)
 
         // Local warp coordinate relative to current threadblock (wg).
         constexpr auto warpDims        = make_coord2d(WARPS_X, WARPS_Y);        //(2,2)
         auto           localWarpCoord  = make_coord2d(threadIdx.x / WARP_SIZE, threadIdx.y);
         auto           localWarpOffset = localWarpCoord * warpTileSize;
 
+        const uint32_t batch_id = blockIdx.z;
+        const uint32_t bx = blockIdx.x;
+        const uint32_t num_qo_heads = gridDim.y;
+        const uint32_t head_id = blockIdx.y;
+
         using MfmaFragDMap1d = GetDataLayout_t<MfmaFragD>;
         // auto Out_macroTileCoord = make_coord2d(blockIdx.x, 0) * macroTileSize;
         // auto Out_warpTileCoord  = Out_macroTileCoord + localWarpOffset;
 
-        const int iterations = (n + MACRO_TILE_Y - 1) / MACRO_TILE_Y;
+        const uint32_t iterations = div_ceil(
+            kv_len,
+            MACRO_TILE_Y);
         // const int sv_iterations = (k + MACRO_TILE_Y - 1) / MACRO_TILE_Y;
 
-        MfmaFragAcc fragsOut[SV_ITERS][BLOCKS_X][BLOCKS_Y];
+        MfmaFragAccf32 fragsOut[SV_ITERS][BLOCKS_X][BLOCKS_Y];
         for(int i = 0; i < SV_ITERS; i++){
             fill(fragsOut[i], 0.0f);
         }
@@ -820,9 +828,9 @@ ROCWMMA_KERNEL void __launch_bounds__(256) gemm_rocwmma_d(uint32_t       m,
 
             // Bounds check
             auto warpTileBound = warpTileCoord + warpTileSize;
-            if(get<0>(warpTileBound) > m || get<1>(warpTileBound) > n)
+            if(get<0>(warpTileBound) > qo_len || get<1>(warpTileBound) > kv_len)
             {
-                return;
+                continue;
             }
 
             ///
@@ -833,9 +841,11 @@ ROCWMMA_KERNEL void __launch_bounds__(256) gemm_rocwmma_d(uint32_t       m,
 
             // Initial globa read address offsets
             auto globalReadOffsetA
-                = GRBuffAMap1d::fromMatrixCoord(make_coord2d(get<0>(macroTileCoord), 0u), lda);
+                = batch_id * stride_bz_q + head_id * stride_h_q
+                + GRBuffAMap1d::fromMatrixCoord(make_coord2d(get<0>(macroTileCoord), 0u), lda);
             auto globalReadOffsetB
-                = GRBuffBMap1d::fromMatrixCoord(make_coord2d(0u, get<1>(macroTileCoord)), ldb);
+                = batch_id * stride_bz_k + (head_id / num_kv_groups) * stride_h_k
+                + GRBuffBMap1d::fromMatrixCoord(make_coord2d(0u, get<1>(macroTileCoord)), ldb);
 
             // Incremental global read address offsets
             auto kStepOffsetA = GRBuffAMap1d::fromMatrixCoord(make_coord2d(0u, ROCWMMA_K), lda);
@@ -862,8 +872,8 @@ ROCWMMA_KERNEL void __launch_bounds__(256) gemm_rocwmma_d(uint32_t       m,
             GRBuffA grBuffA;
             GRBuffB grBuffB;
 
-            globalReadCoopA<warpCount>(grBuffA, a + globalReadOffsetA, lda, warpIndex);
-            globalReadCoopB<warpCount>(grBuffB, b + globalReadOffsetB, ldb, warpIndex);
+            globalReadCoopA<warpCount>(grBuffA, Q + globalReadOffsetA, lda, warpIndex);
+            globalReadCoopB<warpCount>(grBuffB, K + globalReadOffsetB, ldb, warpIndex);
 
             globalReadOffsetA += kStepOffsetA;
             globalReadOffsetB += kStepOffsetB;
@@ -912,10 +922,6 @@ ROCWMMA_KERNEL void __launch_bounds__(256) gemm_rocwmma_d(uint32_t       m,
             ///
             MfmaFragAcc fragsAcc[BLOCKS_X][BLOCKS_Y];
             fill(fragsAcc, 0.0f);
-            // if(blockIdx.x == 0 && threadIdx.x < 3)
-            // {
-            //     printf("fragout size:%u\n",fragsAcc[0][0].num_elements);
-            // }
 
             ///
             /// Synchronize warps and memory
@@ -925,7 +931,7 @@ ROCWMMA_KERNEL void __launch_bounds__(256) gemm_rocwmma_d(uint32_t       m,
             ///
             /// Accumulate A * B for all mfma frags in warp tile
             ///
-            for(uint32_t currentK = ROCWMMA_K; currentK < k; currentK += ROCWMMA_K)
+            for(uint32_t currentK = ROCWMMA_K; currentK < head_dim; currentK += ROCWMMA_K)
             {
                 MfmaFragA fragsA[BLOCKS_X];
                 MfmaFragB fragsB[BLOCKS_Y];
@@ -935,8 +941,8 @@ ROCWMMA_KERNEL void __launch_bounds__(256) gemm_rocwmma_d(uint32_t       m,
                 localReadB(fragsB, ldsPtrLo + ldsReadOffsetB, ldsld);
 
                 // Prefetch next round of global frags
-                globalReadCoopA<warpCount>(grBuffA, a + globalReadOffsetA, lda, warpIndex);
-                globalReadCoopB<warpCount>(grBuffB, b + globalReadOffsetB, ldb, warpIndex);
+                globalReadCoopA<warpCount>(grBuffA, Q + globalReadOffsetA, lda, warpIndex);
+                globalReadCoopB<warpCount>(grBuffB, K + globalReadOffsetB, ldb, warpIndex);
 
                 // Advance offsets to next k step
                 globalReadOffsetA += kStepOffsetA;
@@ -974,8 +980,8 @@ ROCWMMA_KERNEL void __launch_bounds__(256) gemm_rocwmma_d(uint32_t       m,
             //  Here,we try use store/load_matrix_sync interface to get a row data by reset LDS height 
             //  and width logically.
             
-            MfmaFragAcc2 fragsTmp[BLOCKS_X][BLOCKS_Y];
-            convertI32toI8(fragsAcc,fragsTmp);
+            MfmaFragAccf32 fragsTmp[BLOCKS_X][BLOCKS_Y];
+            convertS32toF32(fragsAcc,fragsTmp);
 
             // for(int i = 0; i < BLOCKS_X; i++)
             // {
@@ -987,7 +993,7 @@ ROCWMMA_KERNEL void __launch_bounds__(256) gemm_rocwmma_d(uint32_t       m,
             //         }
             //     }
             // }
-            auto* ldsPtr = reinterpret_cast<InputTV*>(localMemPtr);
+            auto* ldsPtr = reinterpret_cast<ComputeTV*>(localMemPtr);
             constexpr uint32_t ldsWidth_new  = MACRO_TILE_Y;
             constexpr uint32_t ldsHeight_new = 8 * MACRO_TILE_X;
             constexpr uint32_t ldsld_new = std::is_same_v<DataLayoutLds_new, row_major> ? ldsWidth_new : ldsHeight_new;
@@ -997,48 +1003,195 @@ ROCWMMA_KERNEL void __launch_bounds__(256) gemm_rocwmma_d(uint32_t       m,
             localWriteAcc(fragsTmp,ldsPtr + ldsReadOffsetAcc,ldsld_new);
             synchronize_workgroup();
 
+            float original_sm_scale = sm_scale;
+            uint32_t baseq_scale_idx, basek_scale_idx;
+            if constexpr (Q_GRAN == QuantGranularity::kPerThread)
+            {
+                const uint32_t num_warp_block_q = gridDim.x * WARPS_X;//only support 16*16
+                baseq_scale_idx = batch_id * num_qo_heads * (num_warp_block_q * 8) + head_id * (num_warp_block_q * 8) 
+                                + bx * (WARPS_X * 8) + get<0>(localWarpCoord) * 8;
+            }
+            if constexpr (K_GRAN == QuantGranularity::kPerThread)
+            {
+                const uint32_t num_warp_block_k = div_ceil(kv_len, CTA_K) * (CTA_K / WARP_K);
+                basek_scale_idx = batch_id * (num_qo_heads / num_kv_groups) * (num_warp_block_k * 4) 
+                + (head_id / num_kv_groups) * (num_warp_block_k * 4) + iter * 4;
+            }
             //  transform data for validate
             //  actually do softmax ops here
-            // for(int i = 0; i < BLOCKS_X; i++)
-            // {
-            //     for(int j = 0; j < BLOCKS_Y; j++)
-            //     {
-            //         auto baseoffset = ldsReadOffsetAcc + i * ROCWMMA_M * ldsld_new + j * ROCWMMA_N;
-            //         auto threadoffset = threadIdx.x % threads_per_row * els_per_thread
-            //                             + (threadIdx.x) % WARP_SIZE / threads_per_row * ldsld_new;
+            float m_prev = m[fq][k];
+            float m[BLOCKS_X], d[BLOCKS_X];
+            for(int i = 0; i < BLOCKS_X; i++)
+            {
+                m[i] = 0.f;
+            }
 
-            //         if((threadIdx.x / threads_per_row) % 4 == 0){
-            //             for(int k = 0; k < els_per_thread; k++)
-            //             {
-            //                 ldsPtr[baseoffset + threadoffset + k] *= 2;
-            //                 printf("%d ,\n",ldsPtr[baseoffset + threadoffset + k]);
-            //             }
-            //             // if(baseoffset + threadoffset + k > 2048 && baseoffset + threadoffset + k < 3072){
-            //             //     printf("lolcal warp offset:%u\n", baseoffset + threadoffset);
-            //             // }
-            //         }
-            //         else if((threadIdx.x / threads_per_row) % 4 == 1){
-            //             for(int k = 0; k < els_per_thread; k++)
-            //             {
-            //                 ldsPtr[baseoffset + threadoffset + k] -= 7;
-            //             }
-            //         }
-            //         else if((threadIdx.x / threads_per_row) % 4 == 2){
-            //             for(int k = 0; k < els_per_thread; k++)
-            //             {
-            //                 ldsPtr[baseoffset + threadoffset + k] += 9;
-            //             }
-            //         }
-            //         else{
-            //             for(int k = 0; k < els_per_thread; k++)
-            //             {
-            //                 ldsPtr[baseoffset + threadoffset + k] += 3;
-            //             }
-            //         }
-            //     }
-            // }
+            ////    Here,we do update mdo, and we'll make below codes to a func.
+            ////    start
+            for(int i = 0; i < BLOCKS_X; i++)
+            {
+                auto m_tmp = -50000.f
 
-            //load S like fragA
+                // dequant and get max
+                for(int j = 0; j < BLOCKS_Y; j++)
+                {
+                    auto baseoffset = ldsReadOffsetAcc + i * ROCWMMA_M * ldsld_new + j * ROCWMMA_N;
+                    auto threadoffset = threadIdx.x % threads_per_row * els_per_thread
+                                        + (threadIdx.x) % WARP_SIZE / threads_per_row * ldsld_new;
+
+                    uint32_t row = (threadIdx.x % WARP_SIZE / threads_per_row) % 8; //q_scale offset
+                    uint32_t col = (threadIdx.x % threads_per_row * els_per_thread) % 8 / 2; //k_scale offset
+
+                    for(int k = 0; k < els_per_thread; k++)
+                    {
+                        ldsPtr[baseoffset + threadoffset + k] *= (Q_scale[baseq_scale_idx + row] * log2e);
+                        if(k >= els_per_thread / 2){
+                            ldsPtr[baseoffset + threadoffset + k] *= K_scale[basek_scale_idx + col + 1];
+                        }
+                        else ldsPtr[baseoffset + threadoffset + k] *= K_scale[basek_scale_idx + col];
+                        m_tmp = max(m_tmp, ldsPtr[baseoffset + threadoffset + k]);
+                    }
+                }
+
+                m_tmp = max(m_tmp,__shfl_xor_sync(0xffffffff, m_tmp, 1, 4));
+                m_tmp = max(m_tmp,__shfl_xor_sync(0xffffffff, m_tmp, 2, 4));
+
+                // inter-warp get max
+                auto maxval = -50000.f;
+                auto rd_off = MACRO_TILE_X * MACRO_TILE_Y;
+                auto wp_off = get<0>(localWarpOffset) * ldsld_new + i * ROCWMMA_M * ldsld_new;
+                auto th_off = threadIdx.x / threads_per_row * ldsld_new;
+                auto write_off = get<1>(localWarpCoord);
+                
+                if(threadIdx.x % 4 == 0)
+                {
+                    // auto rd_off = MACRO_TILE_X * MACRO_TILE_Y;
+                    // auto wp_off = get<0>(localWarpOffset) * ldsld_new;
+                    // auto th_off = threadIdx.x / threads_per_row * ldsld_new;
+                    // auto write_off = get<1>(localWarpCoord);
+                    ldsPtr[rd_off + wp_off + th_off + write_off] = m_tmp;
+                }
+                synchronize_workgroup();
+
+                m_tmp = max(ldsPtr[rd_off + wp_off + th_off], ldsPtr[rd_off + wp_off + th_off + 1]);
+
+                synchronize_workgroup();
+
+                float m_prev = m[i];
+                m[i] = max(m[i],m_tmp);
+
+                float o_scale = math::ptx_exp2(m_prev - m[fq][k]); //this func may not have compelted
+
+                // update denominator
+                d[i] *= o_scale;
+
+                //here require handle RO
+                for(int k = 0; k < SV_ITERS; k++)
+                {
+                    auto OutOffset = ldsReadOffsetAcc + MACRO_TILE_X * MACRO_TILE_Y;
+                    localWriteOut(fragsOut[k][i],ldsPtr + OutOffset,ldsld_new);
+                    synchronize_workgroup();
+
+                    for(int j = 0; j < BLOCKS_Y; j++)
+                    {
+                        auto baseoffset = OutOffset + i * ROCWMMA_M * ldsld_new + j * ROCWMMA_N;
+                        auto threadoffset = threadIdx.x % threads_per_row * els_per_thread
+                                            + (threadIdx.x) % WARP_SIZE / threads_per_row * ldsld_new;
+
+                        uint32_t row = (threadIdx.x % WARP_SIZE / threads_per_row) % 8; //q_scale offset
+                        uint32_t col = (threadIdx.x % threads_per_row * els_per_thread) % 8 / 2; //k_scale offset
+
+                        for(int k = 0; k < els_per_thread; k++)
+                        {
+                            ldsPtr[baseoffset + threadoffset + k] *= o_scale;
+                        }
+                    }
+
+                    localReadOut(fragsOut[k][i],ldsPtr + OutOffset,ldsld_new);
+                    synchronize_workgroup();
+                }
+
+                // raise RS to exponent
+                float neg_m = -m[i];
+                for(int j = 0; j < BLOCKS_Y; j++)
+                {
+                    auto baseoffset = ldsReadOffsetAcc + i * ROCWMMA_M * ldsld_new + j * ROCWMMA_N;
+                    auto threadoffset = threadIdx.x % threads_per_row * els_per_thread
+                                        + (threadIdx.x) % WARP_SIZE / threads_per_row * ldsld_new;
+                    
+                    for(int k = 0; k < els_per_thread; k++)
+                    {
+                        ldsPtr[baseoffset + threadoffset + k] = math::ptx_exp2(ldsPtr[baseoffset + threadoffset + k] + neg_m);
+                    }
+                }
+            }
+            ////    end.
+
+            // accumlate d
+            // accumulate_d(ldsPtr,d);
+            for(int i = 0; i < BLOCKS_X; i++)
+            {
+                for(int j = 0; j < BLOCKS_Y; j++)
+                {
+                    auto baseoffset = ldsReadOffsetAcc + i * ROCWMMA_M * ldsld_new + j * ROCWMMA_N;
+                    auto threadoffset = threadIdx.x % threads_per_row * els_per_thread
+                                        + (threadIdx.x) % WARP_SIZE / threads_per_row * ldsld_new;
+                    
+                    for(int k = 0; k < els_per_thread; k++)
+                    {
+                        d[i] += ldsPtr[baseoffset + threadoffset + k];
+                    }
+                }
+
+                // inter warp reduce again?
+                synchronize_workgroup();
+            }
+
+            //// cast f32 to fp8
+
+            InputTV RS[BLOCKS_X][BLOCKS_Y][els_per_thread];
+            for(int i = 0; i < BLOCKS_X; i++)
+            {
+                for(int j = 0; j < BLOCKS_Y; j++)
+                {
+                    auto baseoffset = ldsReadOffsetAcc + i * ROCWMMA_M * ldsld_new + j * ROCWMMA_N;
+                    auto threadoffset = threadIdx.x % threads_per_row * els_per_thread
+                                        + (threadIdx.x) % WARP_SIZE / threads_per_row * ldsld_new;
+                    
+                    for(int k = 0; k < els_per_thread; k++)
+                    {
+                        RS[i][j][k] = __hip_cvt_float_to_fp8(ldsPtr[baseoffset + threadoffset + k],
+                                                            __HIP_SATFINITE, __HIP_E4M3_FNUZ);
+                    }
+                }
+            }
+            
+            //  do we need sync here?
+            synchronize_workgroup();
+
+            auto* ldsPtrf8 = reinterpret_cast<InputTV*>(localMemPtr);
+            constexpr uint32_t ldsWidth_fp8  = MACRO_TILE_Y;
+            constexpr uint32_t ldsHeight_fp8 = 8 * MACRO_TILE_X * sizeof(ComputeTV) / sizeof(InputTV);
+            constexpr uint32_t ldsld_fp8 = std::is_same_v<DataLayoutLds_new, row_major> ? ldsWidth_fp8 : ldsHeight_fp8;
+
+            auto ldsReadOffsetsv = get<0>(localWarpOffset) * ldsld_fp8 + get<1>(localWarpOffset);
+            for(int i = 0; i < BLOCKS_X; i++)
+            {
+                for(int j = 0; j < BLOCKS_Y; j++)
+                {
+                    auto baseoffset = ldsReadOffsetsv + i * ROCWMMA_M * ldsld_fp8 + j * ROCWMMA_N;
+                    auto threadoffset = threadIdx.x % threads_per_row * els_per_thread
+                                        + (threadIdx.x) % WARP_SIZE / threads_per_row * ldsld_fp8;
+                    
+                    for(int k = 0; k < els_per_thread; k++)
+                    {
+                        ldsPtrf8[baseoffset + threadoffset + k] = RS[i][j][k];
+                    }
+                }
+            }
+
+
+            //  do we need sync here?
             synchronize_workgroup();
             // MfmaFragA fragsS[BLOCKS_X];
             // auto ldsReadOffsetS = LWBuffAMap1d::fromMatrixCoord(make_coord2d(get<0>(localWarpOffset), 0u), ldsld_new);
@@ -1048,16 +1201,17 @@ ROCWMMA_KERNEL void __launch_bounds__(256) gemm_rocwmma_d(uint32_t       m,
             // //cause we let datalayout lds_new == row_major now!
             // ldsReadOffsetS += YStep;
 
+
             ////    loop
             for(int sv_iter = 0; sv_iter < SV_ITERS; sv_iter++)
             {
                 auto sv_mToffset = sv_iter * get<1>(macroTileSize);
                 auto sv_wpoffset = sv_mToffset + get<1>(localWarpOffset);
 
-                if(sv_wpoffset + get<1>(warpTileSize) > k)
-                {
-                    return;
-                }
+                // if(sv_wpoffset + get<1>(warpTileSize) > k)
+                // {
+                //     continue;
+                // }
 
                 ////  load v and calcualte sv
                 using GRBuffVMap1d = GetDataLayout_t<GRBuffV>;
@@ -1101,24 +1255,95 @@ ROCWMMA_KERNEL void __launch_bounds__(256) gemm_rocwmma_d(uint32_t       m,
                     // Local read mfma frags from first LDS buffer
                     localReadS(fragsS, ldsPtr + ldsReadOffsetS, ldsld_new);
                     ldsReadOffsetS += ROCWMMA_K;
-
+                    // for(int i = 0; i < BLOCKS_X; i++)
+                    // {
+                    //     for(int j = 0; j < fragsS[i].num_elements; j++)
+                    //     {
+                    //         printf("thread id:%u: ",threadIdx.x);
+                    //         printf("%d ",fragsS[i].x[j]);
+                    //     }
+                    //     printf("\n");
+                    // }
+                    // printf("\n");
                     localReadV(fragsV, ldsPtr + ldsReadOffsetV, ldsld_new);
+                    // for(int i=0;i<fragsS[0].num_elements;i++){
+                    //     printf("%d,\n",fragsS[0].x[i]);
+                    // }
 
                     // accum(S * V)
                     svgemm(fragsOut[sv_iter], fragsS, fragsV, fragsOut[sv_iter]);
+                    // for(int i=0;i<fragsOut[0][0][0].num_elements;i++){
+                    //     printf("%d,\n",fragsOut[0][0][0].x[i]);
+                    // }
                     // Make sure that all waves have finished reading / writing to lds for currentK.
                     synchronize_workgroup();
-                }
+                }_
             }
         }
-        // for(int i=0;i<fragsOut[0][0][0].num_elements;i++){
-        //     printf("%d,\n",fragsOut[0][0][0].x[i]);
-        // }
+
+        //// normalize d
+        float d_rcp[BLOCKS_X];
+        for(int i = 0; i < SV_ITERS; i++)
+        {
+            for(int j = 0; j < BLOCKS_X; j++)
+            {
+                d[i][j] += __shfl_xor_sync(0xffffffff, d[i][j], 1, 4);
+                d[i][j] += __shfl_xor_sync(0xffffffff, d[i][j], 2, 4);
+            }
+
+            for(int j = 0; j < BLOCKS_X; j++)
+            {
+                float rd = __builtin_amdgcn_rcpf(d[i][j]);
+                d_rcp[j] = fmaf(-d[i][j] * rd, rd, 2.f * rd);
+            }
+        }
+
+        //// normlize o
+        auto* ldsPtrOut = reinterpret_cast<ComputeTV*>(localMemPtr);
+        constexpr uint32_t ldsWidth_Out  = MACRO_TILE_Y;
+        constexpr uint32_t ldsHeight_Out = 8 * MACRO_TILE_X;
+        constexpr uint32_t ldsld_Out = std::is_same_v<DataLayoutLds_new, row_major> ? ldsWidth_Out : ldsHeight_Out;
+
+        auto ldsReadOffsetAcc = get<0>(localWarpOffset) * ldsld_Out + get<1>(localWarpOffset);
+
+#pragma unroll
+        for(int iter = 0; iter < SV_ITERS; iter++)
+        {
+            localWriteAcc(fragsOut[i],ldsPtrOut + ldsReadOffsetAcc,ldsld_Out);
+            synchronize_workgroup();
+
+#pragma unroll
+            for(int i = 0; i < BLOCKS_X; i++)
+            {
+#pragma unroll
+                for(int j = 0; j < BLOCKS_Y; j++)
+                {
+                    auto baseoffset = ldsReadOffsetAcc + i * ROCWMMA_M * ldsld_Out + j * ROCWMMA_N;
+                    auto threadoffset = threadIdx.x % threads_per_row * els_per_thread
+                                        + (threadIdx.x) % WARP_SIZE / threads_per_row * ldsld_Out;
+                    
+                    auto base_offset = batch_id * (num_qo_heads / num_kv_groups) * head_dim + (head_id / num_kv_groups) * head_dim;
+                    auto scale_idx = iter * MACRO_TILE_Y + get<1>(localWarpOffset) + j * ROCWMMA_N;
+#pragma unroll
+                    for(int k = 0; k < els_per_thread; k++)
+                    {
+                        ldsPtrOut[baseoffset + threadoffset + k] *= d_rcp[i];
+                        auto id = threadIdx.x % WARP_SIZE % threads_per_row;
+                        ldsPtrOut[baseoffset + threadoffset + k] *= V_scale[base_offset + scale_idx + id * els_per_thread + k];
+                    }
+                }
+            }
+
+            localReadAcc(fragsOut[i],ldsPtrOut + ldsReadOffsetAcc,ldsld_Out);
+            synchronize_workgroup();
+        }
+
+
         for(int i = 0; i < SV_ITERS; i++){
             auto Out_macroTileCoord = make_coord2d(blockIdx.x, i) * macroTileSize;
             auto Out_warpTileCoord  = Out_macroTileCoord + localWarpOffset;
 
-            globalWriteD(d + MfmaFragDMap1d::fromMatrixCoord(Out_warpTileCoord, ldd), fragsOut[i], ldd);
+            globalWriteD(O + MfmaFragDMap1d::fromMatrixCoord(Out_warpTileCoord, ldd), fragsOut[i], ldd);
         }
     }
 }
@@ -1199,6 +1424,14 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
     newfillRand1(matrixC.data(), m, n);
     newfillRand1(matrixV.data(), n, k);
 
+    // for(int i = 0; i < m; i++)
+    // {
+    //     for(int j = 0; j < k; j++)
+    //     {
+    //         std::cout << matrixA[i * k + j] << " ";
+    //     }
+    //     std::cout << std::endl;
+    // }
 
     std::cout << "Initializing device data..." << std::endl;
 
@@ -1266,8 +1499,8 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
         return;
     }};
 
-    constexpr uint32_t warmups    = 20u;
-    constexpr uint32_t recordRuns = 50u;
+    constexpr uint32_t warmups    = 0u;
+    constexpr uint32_t recordRuns = 1u;
 
     // Warm-up runs, not recorded
     for(uint32_t i = 0; i < warmups; ++i)
@@ -1315,8 +1548,27 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
               << ldc << ", " << ldd << ", " << elapsedTimeMs << ", " << gFlops << ", "
               << tFlopsPerSec << "," << sizeof(InputT) << std::endl;
 
+    // printf("device result:\n");
+    // for(int i = 0; i < m; i++)
+    // {
+    //     for(int j = 0; j < k; j++)
+    //     {
+    //         printf("%d ", static_cast<int>(d_d[i * k + j]));
+    //     }
+    //     printf("\n");
+    // }
+
+    // printf("V input :\n");
+    // for(int i = 0; i < n; i++)
+    // {
+    //     for(int j = 0; j < k; j++)
+    //     {
+    //         printf("%d ", static_cast<int>(matrixV[i * k + j]));
+    //     }
+    //     printf("\n");
+    // }
 // #if NDEBUG
-#if 0
+#if !NDEBUG
 
     std::cout << "Validating result with reference..." << std::endl;
 
@@ -1352,7 +1604,7 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
         }
         // printf("\n");
     }
-    gemm_cpu_h1<InputT, OutputT, ComputeT, DataLayoutS, DataLayoutB, DataLayoutC>(m,
+    gemm_cpu_h1<InputT, OutputT, ComputeT, DataLayoutA, DataLayoutB, DataLayoutC>(m,
                                                                                  k,
                                                                                  n,
                                                                                  matrixTinput_ref.data(),
@@ -1408,6 +1660,6 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
 
 int main()
 {
-    gemm_test(20480, 20480, 128, 2, 2);
+    gemm_test(64, 64, 64, 2, 2);
     return 0;
 }

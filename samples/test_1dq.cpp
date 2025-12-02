@@ -261,12 +261,12 @@ using namespace gfx11Params;
 /// Types and Data Layouts
 ///
 
-using InputT   = float8_fnuz_t;
-using OutputT  = float32_t;
-using ComputeT = float32_t;
+using InputT   = int8_t;
+using OutputT  = int32_t;
+using ComputeT = int32_t;
 
 using DataLayoutA   = col_major;
-using DataLayoutB   = col_major;
+using DataLayoutB   = row_major;
 using DataLayoutC   = col_major;
 using DataLayoutLds = row_major;
 
@@ -946,6 +946,6 @@ ROCWMMA_HOST void gemm_test(uint32_t m, uint32_t n, uint32_t k, ComputeT alpha, 
 
 int main()
 {
-    gemm_test(8192, 8192, 128, 2, 2);
+    gemm_test(20480, 20480, 128, 2, 2);
     return 0;
 }

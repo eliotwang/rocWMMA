@@ -322,18 +322,18 @@ __host__ void gemm_cpu_h(uint32_t       m,
                 accum += static_cast<ComputeT>(a[aIndex(i, h, lda)])
                          * static_cast<ComputeT>(b[bIndex(h, j, ldb)]);
             }
-            // if(i % 4 == 0){
-            //     accum *= 2;
-            // }
-            // else if(i % 4 == 1){
-            //     accum -= 7;
-            // }
-            // else if(i % 4 == 2){
-            //     accum += 9;
-            // }
-            // else{
-            //     accum += 3;
-            // }
+            if(i % 4 == 0){
+                accum *= 2;
+            }
+            else if(i % 4 == 1){
+                accum -= 7;
+            }
+            else if(i % 4 == 2){
+                accum += 9;
+            }
+            else{
+                accum += 3;
+            }
             accum %= 220;
             d[dIndex(i, j, ldd)] = accum;
         }
